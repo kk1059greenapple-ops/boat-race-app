@@ -954,23 +954,26 @@ def main():
                 st.markdown(f"<div style='background-color: #2b1d1d; color: #ff4b4b; padding: 10px; border-radius: 5px; margin-bottom: 15px; border: 1px solid #ff4b4b;'>🔥 万舟的中モード発動中：上位 **{len(ana['bets'])}** 点を表示</div>", unsafe_allow_html=True)
             
             # Display as cards
-            cols = st.columns(2)
-            for i, bet in enumerate(ana["bets"]):
-                with cols[i % 2]:
-                    odds_val = data["odds"].get(bet["bet"], "取得中..")
-                    odds_str = f"**{odds_val} 倍**" if isinstance(odds_val, (float, int)) else odds_val
-                    
-                    st.markdown(f"""
-                    <div style="background-color: white; border: 2px solid #333; border-radius: 15px; padding: 15px; margin-bottom: 10px; box-shadow: 2px 2px 5px rgba(0,0,0,0.1);">
-                        <div style="display: flex; justify-content: space-between; align-items: center;">
-                            <div style="font-size: 20px; font-weight: bold;">
-                                { ' '.join([f'<span style="background-color: {"#f8f9fa" if c=="1" else "#333" if c=="2" else "#ff4b4b" if c=="3" else "#005ce6" if c=="4" else "#ffa500" if c=="5" else "#28a745"}; color: {"#333" if c=="1" else "white"}; border-radius: 50%; width: 33px; height: 33px; display: inline-flex; align-items: center; justify-content: center; margin-right: 5px; border: 1px solid #ccc;">{c}</span>' for c in bet["bet"].split("-")]) }
+            for i in range(0, len(ana["bets"]), 2):
+                cols = st.columns(2)
+                for j in range(2):
+                    if i + j < len(ana["bets"]):
+                        bet = ana["bets"][i + j]
+                        with cols[j]:
+                            odds_val = data["odds"].get(bet["bet"], "取得中..")
+                            odds_str = f"**{odds_val} 倍**" if isinstance(odds_val, (float, int)) else odds_val
+                            
+                            st.markdown(f"""
+                            <div style="background-color: white; border: 2px solid #333; border-radius: 15px; padding: 15px; margin-bottom: 10px; box-shadow: 2px 2px 5px rgba(0,0,0,0.1);">
+                                <div style="display: flex; justify-content: space-between; align-items: center;">
+                                    <div style="font-size: 20px; font-weight: bold;">
+                                        { ' '.join([f'<span style="background-color: {"#f8f9fa" if c=="1" else "#333" if c=="2" else "#ff4b4b" if c=="3" else "#005ce6" if c=="4" else "#ffa500" if c=="5" else "#28a745"}; color: {"#333" if c=="1" else "white"}; border-radius: 50%; width: 33px; height: 33px; display: inline-flex; align-items: center; justify-content: center; margin-right: 5px; border: 1px solid #ccc;">{c}</span>' for c in bet["bet"].split("-")]) }
+                                    </div>
+                                    <div style="color: #ff4b4b; font-size: 20px; font-weight: bold;">{odds_str}</div>
+                                </div>
+                                <div style="font-size: 13px; color: #666; margin-top: 10px; border-top: 1px solid #eee; padding-top: 5px;">{bet["reason"]}</div>
                             </div>
-                            <div style="color: #ff4b4b; font-size: 20px; font-weight: bold;">{odds_str}</div>
-                        </div>
-                        <div style="font-size: 13px; color: #666; margin-top: 10px; border-top: 1px solid #eee; padding-top: 5px;">{bet["reason"]}</div>
-                    </div>
-                    """, unsafe_allow_html=True)
+                            """, unsafe_allow_html=True)
 
         with tab_all:
             st.markdown("### 📊 3連単全120通り (期待値/確率順)")
