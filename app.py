@@ -138,17 +138,17 @@ async def _headless_boaters_text_extraction(url):
                                             break
                                     
                                     if clicked:
-                                        # タブ切り替えの反映を待機 (表の中に 1着番号が含まれるか等で判定できるが、
-                                        # ここではシンプルに少し長めに待機)
-                                        await page.wait_for_timeout(2000)
+                                        # タブ切り替えの反映を待機
+                                        await page.wait_for_timeout(1000)
                                     
-                                    # 特定のコンテナ（odds-table や table）があればそこから取得。
-                                    # なければ body だが、できるだけ限定する
-                                    container = page.locator(".odds-table, .odds-list, .odds-matrix, .odds-tri").first
-                                    if await container.count() > 0:
-                                        content = await container.inner_text()
-                                    else:
-                                        content = await page.evaluate("() => document.body.innerText")
+                                    try:
+                                        # オッズの表（.css-11kbggr）が完全に表示されるまで待機
+                                        await page.wait_for_selector('.css-11kbggr', timeout=5000)
+                                    except:
+                                        pass
+                                    
+                                    # HTML構造ごと取得してパースするため、ページ全体のHTMLを取得
+                                    content = await page.content()
                                     
                                     full_odds_text += f"\nSTART_BOAT_{b_no}\n" + content
                                 except Exception as e:
@@ -367,75 +367,88 @@ def scrape_full_boaters_workflow(date_str, venue_cd, race_no):
                 if 1.0 < ov < 5000.0:
                     extracted["odds"][f"{b1}-{b2}-{b3}"] = ov
 
-        # 2. セパレータ（START_BOAT_）で分割して各1着ごとに解析
+        # 2. セパレータ（START_BOAT_）で分割して各1着ごとに解析、および全体の一括解析
+        # 実際のオッズ部分は全艇分が1つのマトリックスで表示される場合もあるため、まず全体をパースする
+        soup = BeautifulSoup(full_text, 'html.parser')
+        
+        # 1着艇ごとのコンテナをすべて探す
+        for b1_container in soup.find_all(class_='css-1r6pq8e'):
+            b1_str = None
+            for div in b1_container.children:
+                if div.name == 'div' and '.' in div.get_text():
+                    text = div.get_text(strip=True)
+                    if text and text[0].isdigit():
+                        b1_str = text[0]
+                        break
+            
+            if not b1_str:
+                continue
+                
+            # 2着艇の行(row)を探す
+            for row in b1_container.find_all(class_='css-1hf8agc'):
+                children = list(row.children)
+                if len(children) < 2: continue
+                
+                # 色クラスに依存せず、要素の順序から取得
+                b2_str = children[0].get_text(strip=True)
+                b3_container = children[1]
+                
+                # 3着艇とオッズのセルを探す
+                for cell in b3_container.find_all(class_='css-130bjmo'):
+                    cell_children = list(cell.children)
+                    if len(cell_children) < 2: continue
+                    
+                    b3_str = cell_children[0].get_text(strip=True)
+                    odds_elem = cell.find(class_='css-11kbggr')
+                    if odds_elem:
+                        odds_val = odds_elem.get_text(strip=True)
+                        try:
+                            val = clean_float(odds_val)
+                            if val > 1.0:
+                                extracted["odds"][f"{b1_str}-{b2_str}-{b3_str}"] = val
+                        except Exception:
+                            pass
+
+        # 上記のChakraUI専用パーサーでうまく取れなかった場合のテキストフォールバック
         tab_sections = re.split(r'START_BOAT_([1-6])', full_text)
         for idx in range(1, len(tab_sections), 2):
             b1 = tab_sections[idx]
-            content = tab_sections[idx+1]
-            
-            # コンテンツをトークン化（空白・改行無視）
-            tokens = content.split()
-            if not tokens: continue
-            
-            # --- 強力なシーケンスパース ---
-            # 2着の艇を特定しながら、その後の 3rd_boat & odds のペアを拾う
-            current_b2 = None
-            i = 0
-            while i < len(tokens):
-                t = tokens[i]
-                
-                # 2着の特定（「2」や「2.選手名」）
-                # 通常、2着は 1着以外の 1-6。
-                # Boatersでは "2\n.名前" のように分かれることがある。
-                if t in [str(k) for k in range(1, 7)] and t != b1:
-                    # もし直後のトークンが数字でない（名前など）なら、それは2着のヘッダー
-                    if i + 1 < len(tokens):
-                        next_t = tokens[i+1]
-                        if not next_t.replace(".","").replace("-","").isdigit():
+            html_content = tab_sections[idx+1]
+            found_keys = [k for k in extracted["odds"].keys() if k.startswith(f"{b1}-")]
+            if len(found_keys) < 20:
+                tokens = html_content.split()
+                current_b2 = None
+                i = 0
+                while i < len(tokens):
+                    t = tokens[i]
+                    if t in [str(k) for k in range(1, 7)] and t != b1:
+                        if i + 1 < len(tokens) and not tokens[i+1].replace(".","").replace("-","").isdigit():
                             current_b2 = t
                             i += 1
                             continue
-                
-                # (b3, odds) のペアを検出
-                if current_b2 and t in [str(k) for k in range(1, 7)] and t != b1 and t != current_b2:
-                    if i + 1 < len(tokens):
-                        val_str = tokens[i+1]
-                        val = clean_float(val_str)
-                        if val > 1.0:
-                            extracted["odds"][f"{b1}-{current_b2}-{t}"] = val
-                            i += 2
-                            continue
-                
-                i += 1
-                
-        # 最終手段：各セクションで20個のオッズが見つかるはずなので、数値だけ並べて流し込む
-        # (構造が完全に崩れている場合用)
-        for idx in range(1, len(tab_sections), 2):
-            b1 = tab_sections[idx]
-            content = tab_sections[idx+1]
-            
-            # 既に見つかっている数をチェック
-            found_keys = [k for k in extracted["odds"].keys() if k.startswith(f"{b1}-")]
-            if len(found_keys) < 20:
-                # 浮動小数点数（オッズっぽいもの）をすべて抽出
-                all_floats = [clean_float(f) for f in re.findall(r'(\d+\.\d+)', content)]
-                if len(all_floats) >= 20:
-                    # 1-6の全組み合わせ（b1固定）
-                    others = [str(k) for k in range(1, 7) if str(k) != b1]
-                    perms = []
-                    for b2 in others:
-                        for b3 in others:
-                            if b2 != b3: perms.append((b2, b3))
-                    
-                    # 見つかっている個数と一致しなければ、順番に全埋め
-                    # (Boatersの並び順: 2-1, 2-3... ではないことが多いが、
-                    #  テキスト順序とpermutationsの順序が一致することに期待する)
-                    # ※これはあくまで緊急用
-                    pass
+                    if current_b2 and t in [str(k) for k in range(1, 7)] and t != b1 and t != current_b2:
+                        if i + 1 < len(tokens):
+                            val = clean_float(tokens[i+1])
+                            if val > 1.0:
+                                extracted["odds"][f"{b1}-{current_b2}-{t}"] = val
+                                i += 2
+                                continue
+                    i += 1
 
         extracted["raw_text"] = full_text
         
     return extracted
+
+def calculate_synthetic_odds(bets, odds_dict):
+    valid_odds = []
+    for b in bets:
+        bet_str = b["bet"]
+        val = odds_dict.get(bet_str)
+        if isinstance(val, (int, float)) and val > 0:
+            valid_odds.append(val)
+    if not valid_odds:
+        return 0.0
+    return 1.0 / sum(1.0 / o for o in valid_odds)
 
 def parse_time_with_rank(boats, key_name):
     times = []
@@ -656,7 +669,7 @@ def calculate_oracle(data: dict, venue: str) -> dict:
         "alerts": alerts
     }
 
-def analyze_kimarite_and_bets(oracle_results: dict, data: dict, venue: str, bet_count: int, force_manshu=False) -> dict:
+def analyze_kimarite_and_bets(oracle_results: dict, data: dict, venue: str, bet_count: int, prediction_mode="通常", special_odds_threshold=40.0, special_exclude_1_head=False) -> dict:
     p1 = oracle_results["p1"]
     env = data["env"]
     boats = data["boats"]
@@ -673,15 +686,17 @@ def analyze_kimarite_and_bets(oracle_results: dict, data: dict, venue: str, bet_
     elif conf_score > 70: conf_label = "A"
     elif conf_score > 50: conf_label = "B"
     
-    # --- Man-shu Mode ---
-    manshu_active = force_manshu
-    if not manshu_active:
+    # --- Mode Selection ---
+    manshu_active = (prediction_mode == "万舟的中")
+    manshu_special = (prediction_mode == "万舟特化")
+    
+    if prediction_mode == "通常":
         if clean_float(env.get("wind_spd", 0)) >= 5.0 or clean_float(env.get("wave", 0)) >= 5.0:
             manshu_active = True
-    for b in boats:
-        if b.get("tilt", 0.0) >= 0.5 and b.get("lap_rank") == 1 and b.get("ex_st", 0.15) <= 0.10:
-            manshu_active = True
-            break
+        for b in boats:
+            if b.get("tilt", 0.0) >= 0.5 and b.get("lap_rank") == 1 and b.get("ex_st", 0.15) <= 0.10:
+                manshu_active = True
+                break
             
     top_boats = np.argsort(p1)[::-1]
     top_boat_idx = top_boats[0]
@@ -699,15 +714,45 @@ def analyze_kimarite_and_bets(oracle_results: dict, data: dict, venue: str, bet_
     else:
         kimarite_label = "アウト展開"
         
-    # Override by V-Score if relevant (V-Score >= 0.5 approx 0.05s)
-    # We need to re-check V-Score here or pass it in. For simplicity, we'll use a descriptive label.
-    if manshu_active:
+    if manshu_special:
+        kimarite_label = f"万舟特化（オッズ{int(special_odds_threshold)}倍以上厳選）"
+    elif manshu_active:
         kimarite_label = "万舟波乱（展開待ち）"
 
     combinations = []
     all_120_combinations = []
     
-    if manshu_active:
+    # Base candidates (probabilistic)
+    candidates = []
+    p1_stats = oracle_results["p1"]
+    p2_stats = oracle_results["p2"]
+    p3_stats = oracle_results["p3"]
+    for i in range(6):
+        for j in range(6):
+            if i == j: continue
+            for k in range(6):
+                if i == k or j == k: continue
+                prob_score = p1_stats[i] * p2_stats[j] * p3_stats[k]
+                candidates.append({
+                    "bet": f"{i+1}-{j+1}-{k+1}",
+                    "score": prob_score,
+                    "reason": f"AI推奨：{i+1}軸展開"
+                })
+    
+    if manshu_special:
+        filtered_bets = []
+        odds_data = data.get("odds", {})
+        for c in candidates:
+            if special_exclude_1_head and c["bet"].startswith("1-"):
+                continue
+                
+            odd_val = odds_data.get(c["bet"], 0.0)
+            if isinstance(odd_val, (int, float)) and odd_val >= special_odds_threshold:
+                c["reason"] = f"万舟特化：オッズ{int(special_odds_threshold)}倍以上"
+                filtered_bets.append(c)
+        all_120_combinations = sorted(filtered_bets, key=lambda x: x["score"], reverse=True)
+        combinations = sorted(all_120_combinations[:bet_count], key=lambda x: x["bet"])
+    elif manshu_active:
         # Generate all possible non-1-head combinations
         all_non_1_bets = []
         for h in range(1, 6): # Course 2 to 6
@@ -715,13 +760,9 @@ def analyze_kimarite_and_bets(oracle_results: dict, data: dict, venue: str, bet_
             for c2 in others:
                 for c3 in others:
                     if c2 != c3:
-                        # Holistic strength based scoring for selection
-                        # Head strength * 2nd strength * 3rd strength
                         h_score = oracle_results["scores"][h]
                         c2_score = oracle_results["scores"][c2]
                         c3_score = oracle_results["scores"][c3]
-                        
-                        # Apply course multiplier (Outer head is harder, so we need higher machine strength)
                         score = h_score * (c2_score * 0.5) * (c3_score * 0.3)
                         all_non_1_bets.append({
                             "bet": f"{h+1}-{c2+1}-{c3+1}",
@@ -731,24 +772,6 @@ def analyze_kimarite_and_bets(oracle_results: dict, data: dict, venue: str, bet_
         all_120_combinations = sorted(all_non_1_bets, key=lambda x: x["score"], reverse=True)
         combinations = sorted(all_120_combinations[:bet_count], key=lambda x: x["bet"])
     else:
-        p1_stats = oracle_results["p1"]
-        p2_stats = oracle_results["p2"]
-        p3_stats = oracle_results["p3"]
-        
-        candidates = []
-        for i in range(6):
-            for j in range(6):
-                if i == j: continue
-                for k in range(6):
-                    if i == k or j == k: continue
-                    # Combined probability score
-                    prob_score = p1_stats[i] * p2_stats[j] * p3_stats[k]
-                    candidates.append({
-                        "bet": f"{i+1}-{j+1}-{k+1}",
-                        "score": prob_score,
-                        "reason": f"AI推奨：{i+1}軸展開"
-                    })
-        
         all_120_combinations = sorted(candidates, key=lambda x: x["score"], reverse=True)
         combinations = sorted(all_120_combinations[:bet_count], key=lambda x: x["bet"])
     
@@ -758,7 +781,7 @@ def analyze_kimarite_and_bets(oracle_results: dict, data: dict, venue: str, bet_
         "confidence_label": conf_label,
         "bets": combinations,
         "all_120": all_120_combinations,
-        "manshu": manshu_active,
+        "manshu": manshu_active or manshu_special,
         "alerts": oracle_results["alerts"]
     }
 
@@ -835,23 +858,29 @@ def main():
 
         if st.session_state.history:
             # 最新5件を表示
-            st.table(pd.DataFrame(st.session_state.history).tail(5))
+            st.dataframe(pd.DataFrame(st.session_state.history).tail(5), use_container_width=True, hide_index=True)
             if st.button("履歴をすべてリセット"):
                 st.session_state.history = []
                 st.rerun()
     st.markdown("</div>", unsafe_allow_html=True)
     
     st.markdown("<div class='metric-box'>", unsafe_allow_html=True)
-    col1, col2, col3, col4 = st.columns([2, 1, 1, 1.5])
+    col1, col2, col3, col4 = st.columns([2, 1, 1, 2])
     target_date = col1.date_input("日付")
     venue_name = col2.selectbox("会場", list(VENUES.keys()))
     race_no = col3.selectbox("レース番号", list(range(1, 13)))
-    is_manshu_forced = col4.checkbox("🔥 万舟的中モード", help="過去1年の波乱傾向から外枠アタマを20点狙います")
+    prediction_mode = col4.selectbox("🤖 モード", ["通常", "万舟的中", "万舟特化"])
     
-    # Sidebar settings
-    st.sidebar.markdown("### ⚙️ 予測設定")
-    manshu_points = st.sidebar.selectbox("万舟モード推奨点数", [20, 30], index=0)
-    debug_mode = st.sidebar.checkbox("デバッグモード（生テキストを表示）", value=False)
+    # Detailed Settings for Mobile
+    with st.expander("⚙️ 詳細な予測設定（万舟モード・オッズ閾値など）", expanded=False):
+        st.markdown("<div style='font-size: 14px; color: #666; margin-bottom: 10px;'>※モバイル端末でも設定しやすいようにこちらに配置しました。</div>", unsafe_allow_html=True)
+        col_s1, col_s2 = st.columns(2)
+        with col_s1:
+            manshu_points = st.selectbox("万舟モード推奨点数", [20, 30], index=0)
+            special_exclude_1_head = st.radio("特化モード 1号艇1着", ["1頭入り", "1頭切り"], horizontal=True) == "1頭切り"
+        with col_s2:
+            special_odds_threshold = st.radio("特化モード オッズ閾値", [40.0, 50.0], format_func=lambda x: f"{int(x)}倍以上", horizontal=True)
+            debug_mode = st.checkbox("デバッグモード", value=False)
     
     # 荒れる度の表示
     roughness = VENUE_ROUGHNESS_MAP.get(venue_name, 15.0)
@@ -865,7 +894,7 @@ def main():
     """, unsafe_allow_html=True)
     
     st.markdown("<br>", unsafe_allow_html=True)
-    bet_points = st.radio("表示する推奨買い目（3連単）", [6, 10], horizontal=True, format_func=lambda x: f"最強 {x} 点に絞る")
+    bet_points = st.radio("表示する推奨買い目（通常モードの3連単）", [6, 10], horizontal=True, format_func=lambda x: f"最強 {x} 点に絞る")
     st.markdown("</div>", unsafe_allow_html=True)
 
     if st.button("AI予想を生成（※裏でブラウザを立ち上げてデータ収集します。5〜10秒ほどお待ちください）", type="primary"):
@@ -873,12 +902,12 @@ def main():
             data = scrape_full_boaters_workflow(str(target_date), VENUES[venue_name], race_no)
             oracle_results = calculate_oracle(data, venue_name)
             
-            # If manshu forced, use selected points
-            actual_bet_points = manshu_points if is_manshu_forced else bet_points
-            res_analysis = analyze_kimarite_and_bets(oracle_results, data, venue_name, actual_bet_points, force_manshu=is_manshu_forced)
+            # If manshu mode, use selected points
+            actual_bet_points = manshu_points if prediction_mode in ["万舟的中", "万舟特化"] else bet_points
+            res_analysis = analyze_kimarite_and_bets(oracle_results, data, venue_name, actual_bet_points, prediction_mode=prediction_mode, special_odds_threshold=special_odds_threshold, special_exclude_1_head=special_exclude_1_head)
             
             st.session_state.result = {
-                "data": data, "oracle": oracle_results, "analysis": res_analysis
+                "data": data, "oracle": oracle_results, "analysis": res_analysis, "prediction_mode": prediction_mode
             }
 
     if "result" in st.session_state:
@@ -938,7 +967,7 @@ def main():
                 "3着率(AI)": f"{res['oracle']['p3'][i]*100:.1f}%",
                 "総合スコア": round(res["oracle"]["scores"][i], 2),
             })
-        st.table(pd.DataFrame(df_list))
+        st.dataframe(pd.DataFrame(df_list), use_container_width=True, hide_index=True)
 
         if ana["alerts"]:
             with st.expander("⚠️ AIからの警告メッセージ"):
@@ -950,8 +979,22 @@ def main():
         
         with tab_rec:
             st.markdown(f"### 🔍 {ana['kimarite']} 展開 (自信度: {ana['confidence_label']} / 的中期待値: {ana['confidence']}%)")
-            if is_manshu_forced:
-                st.markdown(f"<div style='background-color: #2b1d1d; color: #ff4b4b; padding: 10px; border-radius: 5px; margin-bottom: 15px; border: 1px solid #ff4b4b;'>🔥 万舟的中モード発動中：上位 **{len(ana['bets'])}** 点を表示</div>", unsafe_allow_html=True)
+            
+            # 合成オッズの算出と表示
+            pred_mode = res.get("prediction_mode", "通常")
+            syn_odds = calculate_synthetic_odds(ana["bets"], data["odds"])
+            if syn_odds > 0:
+                syn_color = "#ff4b4b" if syn_odds >= 10.0 else "#ffa500" if syn_odds >= 3.0 else "#005ce6"
+                mode_name = f"{pred_mode}モード" if pred_mode != "通常" else "最強買い目"
+                st.markdown(f"""
+                <div style="background-color: #f8f9fa; padding: 10px; border-radius: 8px; border-left: 5px solid {syn_color}; margin-bottom: 15px; display: inline-block; box-shadow: 1px 1px 4px rgba(0,0,0,0.1);">
+                    <span style="font-size: 14px; color: #666;">🎯 {mode_name} ({len(ana['bets'])}点) の合成オッズ</span><br>
+                    <span style="font-size: 20px; font-weight: bold; color: {syn_color};">{syn_odds:.2f} 倍</span>
+                </div>
+                """, unsafe_allow_html=True)
+
+            if pred_mode in ["万舟的中", "万舟特化"]:
+                st.markdown(f"<div style='background-color: #2b1d1d; color: #ff4b4b; padding: 10px; border-radius: 5px; margin-bottom: 15px; border: 1px solid #ff4b4b;'>🔥 {pred_mode}モード発動中：上位 **{len(ana['bets'])}** 点を表示</div>", unsafe_allow_html=True)
             
             # Display as cards
             for i in range(0, len(ana["bets"]), 2):
