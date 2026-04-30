@@ -10,6 +10,7 @@ import warnings
 import asyncio
 import nest_asyncio
 import os
+import json
 import subprocess
 import sys
 import warnings
@@ -87,7 +88,7 @@ def clean_float(val, fallback=0.0):
         return float(nums[0]) if nums else fallback
     except: return fallback
 
-async def _headless_boaters_text_extraction(url):
+async def _headless_boaters_text_extraction(url, venue_cd):
     tab_texts = {}
     async with async_playwright() as p:
         # Streamlit Cloudなどの制限環境向けに args を追加
@@ -174,6 +175,15 @@ async def _headless_boaters_text_extraction(url):
                             try: await page.get_by_text("AI３連対率", exact=True).nth(0).click(timeout=3000)
                             except: pass
                             await page.wait_for_timeout(1500)
+                            
+                            # 江戸川の場合は「当地」タブをクリックして当地成績を取得
+                            if venue_cd == "edogawa":
+                                try:
+                                    await page.get_by_text("当地", exact=True).nth(0).click(timeout=3000)
+                                    await page.wait_for_timeout(2000)
+                                except Exception as e:
+                                    print(f"Failed to click 当地: {e}")
+                            
                             tab_texts['連対率・展開'] = await page.evaluate("() => document.body.innerText")
                         except: pass
 
@@ -188,12 +198,12 @@ def scrape_full_boaters_workflow(date_str, venue_cd, race_no):
     # url mapping correctly uses literal venue code eg hamanako and date string
     url = f"https://boaters-boatrace.com/race/{venue_cd}/{date_str}/{race_no}R"
     
-    tab_texts = asyncio.run(_headless_boaters_text_extraction(url))
+    tab_texts = asyncio.run(_headless_boaters_text_extraction(url, venue_cd))
     
     extracted = {
         "env": {"wind_spd": 0, "wind_dir": "無風", "wave": "-", "water_level": "-", "water_temp": "-"},
         "boats": [{"course": i+1, "name": "-", "class": "-", 
-                   "top1_rate": 15.0, "top2_rate": 20.0, "top3_rate": 35.0,
+                   "top1_rate": 15.0, "top2_rate": 20.0, "top3_rate": 35.0, "win_rate": 10.0,
                    "avg_st": 0.16, "avg_st_rank": 3.0, "course_avg_st": "-", "course_avg_st_rank": "-",
                    "kimarite_nige": 0.0, "kimarite_sashi": 0.0, "kimarite_makuri": 0.0,
                    "ex_st": "-", "motor_2ren": 30.0, "motor_3ren": 40.0,
@@ -324,6 +334,8 @@ def scrape_full_boaters_workflow(date_str, venue_cd, race_no):
                         extracted["boats"][idx]["top1_rate"] = percents[0]
                         extracted["boats"][idx]["top2_rate"] = percents[1]
                         extracted["boats"][idx]["top3_rate"] = percents[2]
+                        if len(percents) >= 5:
+                            extracted["boats"][idx]["win_rate"] = percents[2] # 1着率は3番目の要素
                     break
                     
         # Course Average ST
@@ -582,8 +594,8 @@ def calculate_oracle(data: dict, venue: str) -> dict:
     for i in range(1, 6):
         prev_b = boats[i-1]
         b = boats[i]
-        ext_diff = (prev_b.get("ex_time", 6.85) - b.get("ex_time", 6.85))
-        ast_diff = (prev_b.get("avg_st", 0.16) - b.get("avg_st", 0.16))
+        ext_diff = (clean_float(prev_b.get("ex_time", 6.85), 6.85) - clean_float(b.get("ex_time", 6.85), 6.85))
+        ast_diff = (clean_float(prev_b.get("avg_st", 0.16), 0.16) - clean_float(b.get("avg_st", 0.16), 0.16))
         v_scores[i] = (ext_diff * 10 * 0.6) + (ast_diff * 10 * 0.4)
         if v_scores[i] >= 0.5:
             alerts.append(f"【V-Score】{i+1}号艇 直まくり優位性あり")
@@ -593,29 +605,40 @@ def calculate_oracle(data: dict, venue: str) -> dict:
     for i in range(6):
         b = boats[i]
         
-        # A. Machine Performance (Original Exhibition)
-        # Lap: 37.0 is avg, lower is better. Turn/Straight: higher is better (but here they are times? No, Boaters uses ranks usually, but we got floats)
-        # If they are times, lower is better. Let's assume they are times.
-        m_perf = 0
-        try:
-            lap_score = max(0, (38.0 - clean_float(b.get("lap_time", 38.0))) * 40)
-            turn_score = max(0, (6.0 - clean_float(b.get("turn", 6.0))) * 20)
-            strt_score = max(0, (8.0 - clean_float(b.get("straight", 8.0))) * 20)
-            m_perf = lap_score + turn_score + strt_score
-        except: pass
-        
-        # B. Exhibition Time
-        ex_perf = max(0, (7.0 - clean_float(b.get("ex_time", 7.0))) * 100)
-        
-        # C. Winning Records (Win Rates)
-        win_perf = (b.get("top1_rate", 0) * 0.6 + b.get("top2_rate", 0) * 0.3 + b.get("top3_rate", 0) * 0.1)
-        
-        # D. Start Ability
-        st_perf = max(0, (0.25 - b.get("course_avg_st", 0.18)) * 200)
-        st_rank_bonus = (7 - b.get("course_avg_st_rank", 6)) * 5
-        
-        # E. Composite Score
-        total = m_perf + ex_perf + win_perf + st_perf + st_rank_bonus
+        if venue == "江戸川":
+            # 江戸川専用ロジック (オリジナル展示非公表対策)
+            local_win = clean_float(b.get("win_rate", b.get("top3_rate", 0.0)))
+            motor_2ren = clean_float(b.get("motor_2ren", 30.0))
+            ex_time = clean_float(b.get("ex_time", 7.0), 7.0)
+            
+            ex_perf = max(0, (7.0 - ex_time) * 200)  # 通常展示タイムの比重を高める
+            win_perf = local_win * 2.0               # 当地勝率の比重を高める
+            motor_perf = motor_2ren * 1.5            # モーター連対率の比重を高める
+            st_perf = max(0, (0.25 - clean_float(b.get("course_avg_st", 0.18))) * 100)
+            
+            total = ex_perf + win_perf + motor_perf + st_perf
+        else:
+            # A. Machine Performance (Original Exhibition)
+            m_perf = 0
+            try:
+                lap_score = max(0, (38.0 - clean_float(b.get("lap_time", 38.0))) * 40)
+                turn_score = max(0, (6.0 - clean_float(b.get("turn", 6.0))) * 20)
+                strt_score = max(0, (8.0 - clean_float(b.get("straight", 8.0))) * 20)
+                m_perf = lap_score + turn_score + strt_score
+            except: pass
+            
+            # B. Exhibition Time
+            ex_perf = max(0, (7.0 - clean_float(b.get("ex_time", 7.0), 7.0)) * 100)
+            
+            # C. Winning Records (Win Rates)
+            win_perf = (b.get("top1_rate", 0) * 0.6 + b.get("top2_rate", 0) * 0.3 + b.get("top3_rate", 0) * 0.1)
+            
+            # D. Start Ability
+            st_perf = max(0, (0.25 - clean_float(b.get("course_avg_st", 0.18))) * 200)
+            st_rank_bonus = (7 - b.get("course_avg_st_rank", 6)) * 5
+            
+            # E. Composite Score
+            total = m_perf + ex_perf + win_perf + st_perf + st_rank_bonus
         
         # F. Adjustments (Environment/V-Score/Fraud)
         # Apply the logic that was previously in s1 but more broadly
@@ -688,16 +711,9 @@ def analyze_kimarite_and_bets(oracle_results: dict, data: dict, venue: str, bet_
     
     # --- Mode Selection ---
     manshu_active = (prediction_mode == "万舟的中")
-    manshu_special = (prediction_mode == "万舟特化")
+    manshu_special = (prediction_mode == "中穴・大穴的中")
     
-    if prediction_mode == "通常":
-        if clean_float(env.get("wind_spd", 0)) >= 5.0 or clean_float(env.get("wave", 0)) >= 5.0:
-            manshu_active = True
-        for b in boats:
-            if b.get("tilt", 0.0) >= 0.5 and b.get("lap_rank") == 1 and b.get("ex_st", 0.15) <= 0.10:
-                manshu_active = True
-                break
-            
+
     top_boats = np.argsort(p1)[::-1]
     top_boat_idx = top_boats[0]
     
@@ -715,9 +731,9 @@ def analyze_kimarite_and_bets(oracle_results: dict, data: dict, venue: str, bet_
         kimarite_label = "アウト展開"
         
     if manshu_special:
-        kimarite_label = f"万舟特化（オッズ{int(special_odds_threshold)}倍以上厳選）"
+        kimarite_label = f"中穴・大穴（オッズ{int(special_odds_threshold)}倍以上厳選）"
     elif manshu_active:
-        kimarite_label = "万舟波乱（展開待ち）"
+        kimarite_label = "万舟的中（オッズ100倍以上厳選）"
 
     combinations = []
     all_120_combinations = []
@@ -738,6 +754,15 @@ def analyze_kimarite_and_bets(oracle_results: dict, data: dict, venue: str, bet_
                     "score": prob_score,
                     "reason": f"AI推奨：{i+1}軸展開"
                 })
+                
+    # --- 適正オッズ(理論オッズ)の計算 ---
+    total_score = sum(c["score"] for c in candidates)
+    for c in candidates:
+        if total_score > 0 and c["score"] > 0:
+            hit_prob = c["score"] / total_score
+            c["fair_odds"] = round(1.0 / hit_prob, 1)
+        else:
+            c["fair_odds"] = 9999.9
     
     if manshu_special:
         filtered_bets = []
@@ -748,28 +773,22 @@ def analyze_kimarite_and_bets(oracle_results: dict, data: dict, venue: str, bet_
                 
             odd_val = odds_data.get(c["bet"], 0.0)
             if isinstance(odd_val, (int, float)) and odd_val >= special_odds_threshold:
-                c["reason"] = f"万舟特化：オッズ{int(special_odds_threshold)}倍以上"
+                c["reason"] = f"中穴・大穴：オッズ{int(special_odds_threshold)}倍以上"
                 filtered_bets.append(c)
         all_120_combinations = sorted(filtered_bets, key=lambda x: x["score"], reverse=True)
         combinations = sorted(all_120_combinations[:bet_count], key=lambda x: x["bet"])
     elif manshu_active:
-        # Generate all possible non-1-head combinations
-        all_non_1_bets = []
-        for h in range(1, 6): # Course 2 to 6
-            others = [i for i in range(6) if i != h]
-            for c2 in others:
-                for c3 in others:
-                    if c2 != c3:
-                        h_score = oracle_results["scores"][h]
-                        c2_score = oracle_results["scores"][c2]
-                        c3_score = oracle_results["scores"][c3]
-                        score = h_score * (c2_score * 0.5) * (c3_score * 0.3)
-                        all_non_1_bets.append({
-                            "bet": f"{h+1}-{c2+1}-{c3+1}",
-                            "score": score,
-                            "reason": f"万舟モード：{h+1}アタマ展開"
-                        })
-        all_120_combinations = sorted(all_non_1_bets, key=lambda x: x["score"], reverse=True)
+        filtered_bets = []
+        odds_data = data.get("odds", {})
+        for c in candidates:
+            if special_exclude_1_head and c["bet"].startswith("1-"):
+                continue
+                
+            odd_val = odds_data.get(c["bet"], 0.0)
+            if isinstance(odd_val, (int, float)) and odd_val >= 100.0:
+                c["reason"] = f"万舟的中：オッズ100倍以上"
+                filtered_bets.append(c)
+        all_120_combinations = sorted(filtered_bets, key=lambda x: x["score"], reverse=True)
         combinations = sorted(all_120_combinations[:bet_count], key=lambda x: x["bet"])
     else:
         all_120_combinations = sorted(candidates, key=lambda x: x["score"], reverse=True)
@@ -816,21 +835,87 @@ def calculate_profit_stats(history, next_invest=1000):
         "num_hits": num_hits
     }
 
+HISTORY_FILE = "profit_history.json"
+
+def load_history():
+    if os.path.exists(HISTORY_FILE):
+        try:
+            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                # Ensure all users exist in the loaded data
+                for u in ["T", "K", "H"]:
+                    if u not in data:
+                        data[u] = []
+                return data
+        except:
+            return {"T": [], "K": [], "H": []}
+    return {"T": [], "K": [], "H": []}
+
+def save_history(data):
+    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=4)
+
 def main():
-    if "history" not in st.session_state:
-        st.session_state.history = []
+    if "all_histories" not in st.session_state:
+        st.session_state.all_histories = load_history()
     
     st.title("⛴️ BoatPredict Elite (Boaters JP)")
     st.markdown("🌐 Selenium搭載: SPA突破型フルオートスクレイピング＆オラクル予測")
+    
+    # --- 波乱レース検索 (Sidebar) ---
+    st.sidebar.markdown("### 🔥 波乱(万舟)レース検索")
+    st.sidebar.caption("全レースの出走表から荒れそうなレースを自動判定します。")
+    if st.sidebar.button("🔍 本日の全レースを検索", use_container_width=True):
+        st.session_state.run_rough_search = True
+        
+    if st.session_state.get("run_rough_search", False):
+        st.markdown("---")
+        st.header("🔥 本日の波乱レース検索結果 (Top 10)")
+        with st.spinner("boatrace.jp から全レースの出走表を解析中... (数秒かかります)"):
+            import rough_race_finder
+            try:
+                loop = asyncio.get_event_loop()
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+            
+            if loop.is_running():
+                import nest_asyncio
+                nest_asyncio.apply()
+                future = asyncio.ensure_future(rough_race_finder.find_rough_races_today())
+                rough_races = loop.run_until_complete(future)
+            else:
+                rough_races = loop.run_until_complete(rough_race_finder.find_rough_races_today())
+            
+        if not rough_races:
+            st.warning("本日のレースデータが見つかりませんでした。")
+        else:
+            top_races = rough_races[:10]
+            df_data = []
+            for r in top_races:
+                df_data.append({
+                    "ランク": r["rank"],
+                    "レース": f"{r['venue']} {r['race_no']}R",
+                    "スコア": r["score"],
+                    "波乱理由": ", ".join(r["reasons"])
+                })
+            st.dataframe(pd.DataFrame(df_data), use_container_width=True, hide_index=True)
+            
+        if st.button("検索結果を閉じる"):
+            st.session_state.run_rough_search = False
+            st.rerun()
     
     # --- 収益計算ダッシュボード (Top Section) ---
     st.markdown("<div class='metric-box' style='border-left: 8px solid #00d4ff;'>", unsafe_allow_html=True)
     st.markdown("#### 💰 収支管理ダッシュボード")
     
+    current_user = st.radio("👤 利用者を選択", ["T", "K", "H"], horizontal=True)
+    
     # 次戦投資額の入力
     next_invest_val = st.number_input("次戦の予定投資額 (円)", min_value=100, step=100, value=1000, help="この金額を元に「捲るための必要オッズ」を計算します")
     
-    stats = calculate_profit_stats(st.session_state.history, next_invest_val)
+    current_history = st.session_state.all_histories.get(current_user, [])
+    stats = calculate_profit_stats(current_history, next_invest_val)
     
     col_a, col_b, col_c, col_d = st.columns([1, 1, 1.5, 2])
     col_a.metric("回収率", f"{stats['recovery_rate']:.1f}%")
@@ -843,24 +928,26 @@ def main():
     else:
         col_d.success(f"📈 利益継続中！")
         
-    with st.expander("📝 レース結果を記録 / 履歴管理"):
+    with st.expander(f"📝 {current_user} のレース結果を記録 / 履歴管理"):
         with st.form("top_profit_form"):
             c1, c2 = st.columns(2)
             f_invest = c1.number_input("投資金額 (円)", min_value=0, step=100, value=1000)
             f_payout = c2.number_input("的中金額 (円)", min_value=0, step=10, value=0)
             if st.form_submit_button("収支を記録"):
-                st.session_state.history.append({
-                    "date": str(datetime.now().strftime("%H:%M")),
+                st.session_state.all_histories[current_user].append({
+                    "date": str(datetime.now().strftime("%Y/%m/%d %H:%M")),
                     "invest": f_invest,
                     "payout": f_payout
                 })
+                save_history(st.session_state.all_histories)
                 st.rerun()
 
-        if st.session_state.history:
+        if current_history:
             # 最新5件を表示
-            st.dataframe(pd.DataFrame(st.session_state.history).tail(5), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(current_history).tail(5), use_container_width=True, hide_index=True)
             if st.button("履歴をすべてリセット"):
-                st.session_state.history = []
+                st.session_state.all_histories[current_user] = []
+                save_history(st.session_state.all_histories)
                 st.rerun()
     st.markdown("</div>", unsafe_allow_html=True)
     
@@ -869,17 +956,34 @@ def main():
     target_date = col1.date_input("日付")
     venue_name = col2.selectbox("会場", list(VENUES.keys()))
     race_no = col3.selectbox("レース番号", list(range(1, 13)))
-    prediction_mode = col4.selectbox("🤖 モード", ["通常", "万舟的中", "万舟特化"])
+    prediction_mode = col4.selectbox("🤖 モード", ["通常", "万舟的中", "中穴・大穴的中"])
     
     # Detailed Settings for Mobile
-    with st.expander("⚙️ 詳細な予測設定（万舟モード・オッズ閾値など）", expanded=False):
+    is_manshu_mode = prediction_mode in ["万舟的中", "中穴・大穴的中"]
+    with st.expander("⚙️ 詳細な予測設定（万舟モード・オッズ閾値など）", expanded=is_manshu_mode):
         st.markdown("<div style='font-size: 14px; color: #666; margin-bottom: 10px;'>※モバイル端末でも設定しやすいようにこちらに配置しました。</div>", unsafe_allow_html=True)
+        
+        # デフォルト値
+        manshu_points = 20
+        special_exclude_1_head = False
+        special_odds_threshold = 40.0
+        
         col_s1, col_s2 = st.columns(2)
         with col_s1:
-            manshu_points = st.selectbox("万舟モード推奨点数", [20, 30], index=0)
-            special_exclude_1_head = st.radio("特化モード 1号艇1着", ["1頭入り", "1頭切り"], horizontal=True) == "1頭切り"
+            if prediction_mode == "万舟的中":
+                manshu_points = st.selectbox("万舟的中モード：推奨点数", [20, 30, 40], index=0)
+                st.markdown("<div style='margin-bottom: 5px;'></div>", unsafe_allow_html=True)
+                special_exclude_1_head = st.radio("万舟的中モード：1号艇1着", ["1頭入り", "1頭切り"], horizontal=True) == "1頭切り"
+            elif prediction_mode == "中穴・大穴的中":
+                manshu_points = st.selectbox("中穴・大穴的中モード：推奨点数", [10, 20, 30, 40], index=0)
+                st.markdown("<div style='margin-bottom: 5px;'></div>", unsafe_allow_html=True)
+                special_exclude_1_head = st.radio("中穴・大穴的中モード：1号艇1着", ["1頭入り", "1頭切り"], horizontal=True) == "1頭切り"
+            else:
+                st.write("通常モードではこの設定は使用されません")
+                
         with col_s2:
-            special_odds_threshold = st.radio("特化モード オッズ閾値", [40.0, 50.0], format_func=lambda x: f"{int(x)}倍以上", horizontal=True)
+            if prediction_mode == "中穴・大穴的中":
+                special_odds_threshold = st.radio("中穴・大穴的中モード：オッズ閾値", [20.0, 30.0, 40.0, 50.0], index=2, format_func=lambda x: f"{int(x)}倍以上", horizontal=True)
             debug_mode = st.checkbox("デバッグモード", value=False)
     
     # 荒れる度の表示
@@ -903,7 +1007,7 @@ def main():
             oracle_results = calculate_oracle(data, venue_name)
             
             # If manshu mode, use selected points
-            actual_bet_points = manshu_points if prediction_mode in ["万舟的中", "万舟特化"] else bet_points
+            actual_bet_points = manshu_points if prediction_mode in ["万舟的中", "中穴・大穴的中"] else bet_points
             res_analysis = analyze_kimarite_and_bets(oracle_results, data, venue_name, actual_bet_points, prediction_mode=prediction_mode, special_odds_threshold=special_odds_threshold, special_exclude_1_head=special_exclude_1_head)
             
             st.session_state.result = {
@@ -993,7 +1097,7 @@ def main():
                 </div>
                 """, unsafe_allow_html=True)
 
-            if pred_mode in ["万舟的中", "万舟特化"]:
+            if pred_mode in ["万舟的中", "中穴・大穴的中"]:
                 st.markdown(f"<div style='background-color: #2b1d1d; color: #ff4b4b; padding: 10px; border-radius: 5px; margin-bottom: 15px; border: 1px solid #ff4b4b;'>🔥 {pred_mode}モード発動中：上位 **{len(ana['bets'])}** 点を表示</div>", unsafe_allow_html=True)
             
             # Display as cards
@@ -1004,7 +1108,19 @@ def main():
                         bet = ana["bets"][i + j]
                         with cols[j]:
                             odds_val = data["odds"].get(bet["bet"], "取得中..")
-                            odds_str = f"**{odds_val} 倍**" if isinstance(odds_val, (float, int)) else odds_val
+                            fair_odds = bet.get("fair_odds", 9999.9)
+                            
+                            is_delicious = False
+                            if isinstance(odds_val, (float, int)):
+                                is_delicious = odds_val > fair_odds
+                                odds_text = f"{odds_val}倍 (適正: {fair_odds}倍)"
+                            else:
+                                odds_text = f"取得中.. (適正: {fair_odds}倍)"
+                                
+                            if is_delicious:
+                                odds_html = f"<div style='color: #ff4b4b; font-size: 18px; font-weight: bold;'>🔥 {odds_text}</div>"
+                            else:
+                                odds_html = f"<div style='color: #333; font-size: 16px; font-weight: bold;'>{odds_text}</div>"
                             
                             st.markdown(f"""
                             <div style="background-color: white; border: 2px solid #333; border-radius: 15px; padding: 15px; margin-bottom: 10px; box-shadow: 2px 2px 5px rgba(0,0,0,0.1);">
@@ -1012,7 +1128,7 @@ def main():
                                     <div style="font-size: 20px; font-weight: bold;">
                                         { ' '.join([f'<span style="background-color: {"#f8f9fa" if c=="1" else "#333" if c=="2" else "#ff4b4b" if c=="3" else "#005ce6" if c=="4" else "#ffa500" if c=="5" else "#28a745"}; color: {"#333" if c=="1" else "white"}; border-radius: 50%; width: 33px; height: 33px; display: inline-flex; align-items: center; justify-content: center; margin-right: 5px; border: 1px solid #ccc;">{c}</span>' for c in bet["bet"].split("-")]) }
                                     </div>
-                                    <div style="color: #ff4b4b; font-size: 20px; font-weight: bold;">{odds_str}</div>
+                                    {odds_html}
                                 </div>
                                 <div style="font-size: 13px; color: #666; margin-top: 10px; border-top: 1px solid #eee; padding-top: 5px;">{bet["reason"]}</div>
                             </div>
@@ -1025,12 +1141,21 @@ def main():
             all_df_data = []
             for item in ana["all_120"]:
                 odds_v = data["odds"].get(item["bet"], "-")
+                fair_odds_v = item.get("fair_odds", 9999.9)
                 score_v = item["score"]
-                # Display rounded scores for readability
+                
+                is_umami = False
+                if isinstance(odds_v, (float, int)) and odds_v > fair_odds_v:
+                    is_umami = True
+                    
+                odds_display = f"{odds_v} (適正: {fair_odds_v})"
+                if is_umami:
+                    odds_display = f"🔥 {odds_display}"
+                    
                 all_df_data.append({
                     "順位": len(all_df_data) + 1,
                     "買い目": item["bet"],
-                    "オッズ": odds_v,
+                    "オッズ": odds_display,
                     "期待スコア": round(score_v * 1000, 2), # Scale for readability
                     "解析根拠": item["reason"]
                 })
