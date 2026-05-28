@@ -26,6 +26,7 @@ except ImportError:
 
 from venue_win_rates import get_venue_course_win_rate
 from wind_condition_modifier import apply_wind_modifier
+from users import add_user, delete_user, load_users, authenticate_user, change_user_password, change_admin_password, authenticate_admin
 
 # Streamlit Cloud 用の Playwright インストール確認
 def ensure_playwright_installed():
@@ -1271,10 +1272,213 @@ def save_learning_db(data):
     with open(LEARNING_DB_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=4)
 
+def show_login_page():
+    # Inject premium styles for Wow-factor UI
+    st.markdown("""
+    <style>
+    .login-container-box {
+        background: rgba(15, 23, 42, 0.65);
+        backdrop-filter: blur(20px);
+        -webkit-backdrop-filter: blur(20px);
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        border-radius: 20px;
+        padding: 40px;
+        max-width: 500px;
+        margin: 50px auto;
+        box-shadow: 0 15px 35px rgba(0, 0, 0, 0.5);
+        text-align: center;
+    }
+    .login-title-h1 {
+        font-size: 38px;
+        font-weight: 800;
+        margin-bottom: 5px;
+        background: linear-gradient(135deg, #3b82f6 0%, #8b5cf6 50%, #ef4444 100%);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+    }
+    .login-subtitle-p {
+        font-size: 15px;
+        color: #94a3b8;
+        margin-bottom: 30px;
+    }
+    /* Style normal inputs inside tabs for premium look */
+    div[data-testid="stTextInput"] input {
+        background-color: rgba(30, 41, 59, 0.8) !important;
+        border: 1px solid rgba(255, 255, 255, 0.1) !important;
+        border-radius: 10px !important;
+        color: #f1f5f9 !important;
+        padding: 12px 15px !important;
+    }
+    div[data-testid="stTextInput"] input:focus {
+        border-color: #6366f1 !important;
+        box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.2) !important;
+    }
+    /* Style buttons in login form */
+    div.stButton > button {
+        background: linear-gradient(135deg, #3b82f6 0%, #8b5cf6 100%) !important;
+        color: white !important;
+        font-size: 16px !important;
+        font-weight: 700 !important;
+        padding: 10px 24px !important;
+        border-radius: 10px !important;
+        border: none !important;
+        width: 100% !important;
+        box-shadow: 0 4px 15px rgba(59, 130, 246, 0.3) !important;
+        transition: all 0.3s ease !important;
+    }
+    div.stButton > button:hover {
+        transform: translateY(-2px) !important;
+        box-shadow: 0 6px 20px rgba(59, 130, 246, 0.5) !important;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+    
+    st.markdown("""
+    <div class="login-container-box">
+        <div class="login-title-h1">BoatPredict Elite</div>
+        <div class="login-subtitle-p">プレミアム・AIボートレース分析＆予想システム</div>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    tabs = st.tabs(["🔑 一般ユーザーログイン", "🛡️ 開発者ログイン"])
+    
+    with tabs[0]:
+        with st.form("user_login_form"):
+            username = st.text_input("ユーザーID (Username)", placeholder="ユーザー名を入力してください")
+            password = st.text_input("パスワード (Password)", type="password", placeholder="パスワードを入力してください")
+            submit = st.form_submit_button("ログイン")
+            if submit:
+                if not username or not password:
+                    st.error("⚠️ ユーザーIDとパスワードを入力してください。")
+                elif authenticate_user(username, password):
+                    st.session_state.logged_in = True
+                    st.session_state.username = username
+                    st.session_state.is_admin = False
+                    st.success(f"🎉 ログイン成功！ようこそ {username} 様")
+                    st.rerun()
+                else:
+                    st.error("❌ ユーザーIDまたはパスワードが正しくありません。")
+                    
+    with tabs[1]:
+        with st.form("admin_login_form"):
+            admin_pwd = st.text_input("開発者パスワード (Developer Password)", type="password", placeholder="マスターパスワードを入力してください")
+            submit_admin = st.form_submit_button("管理者ログイン")
+            if submit_admin:
+                if authenticate_admin(admin_pwd):
+                    st.session_state.logged_in = True
+                    st.session_state.username = "admin"
+                    st.session_state.is_admin = True
+                    st.success("🛡️ 開発者認証に成功しました！管理画面に入ります。")
+                    st.rerun()
+                else:
+                    st.error("❌ 開発者パスワードが正しくありません。")
+
+def show_admin_page():
+    st.markdown("<div class='metric-box' style='border-left: 8px solid #8b5cf6;'>", unsafe_allow_html=True)
+    st.header("🛡️ 開発者管理画面 (Developer Admin Panel)")
+    st.markdown("登録ユーザーの追加・削除・パスワード変更、および管理者パスワードの変更を行います。")
+    st.markdown("</div>", unsafe_allow_html=True)
+    
+    st.markdown("<br>", unsafe_allow_html=True)
+    st.subheader("👤 利用者（ユーザー）の新規追加")
+    with st.form("add_user_form"):
+        new_username = st.text_input("新規ユーザーID", placeholder="英語または数字（スペースなし・小文字推奨）")
+        new_password = st.text_input("新規パスワード", type="password", placeholder="初期パスワードを設定")
+        submit_add = st.form_submit_button("新規ユーザーを追加登録する")
+        if submit_add:
+            success, msg = add_user(new_username, new_password)
+            if success:
+                st.success(f"✅ {msg}")
+            else:
+                st.error(f"❌ {msg}")
+                
+    st.markdown("---")
+    st.subheader("👥 登録済みユーザーの管理（パスワード変更 ＆ 削除）")
+    
+    users = load_users()
+    if not users:
+        st.info("現在、登録されている一般ユーザーはいません。")
+    else:
+        user_list = []
+        for uname, uinfo in users.items():
+            user_list.append({
+                "ユーザーID": uname,
+                "ハッシュ値 (SHA-256)": uinfo.get("password_hash")[:32] + "..."
+            })
+        st.dataframe(pd.DataFrame(user_list), use_container_width=True, hide_index=True)
+        
+        # 1. 使用者のパスワード変更
+        st.markdown("<br>", unsafe_allow_html=True)
+        st.markdown("#### 🔑 利用者のパスワード変更")
+        with st.form("change_user_pwd_form"):
+            change_uname = st.selectbox("パスワードを変更するユーザーIDを選択してください", list(users.keys()))
+            change_pwd = st.text_input("新しいパスワードを入力してください", type="password", placeholder="新パスワードを設定")
+            submit_change_pwd = st.form_submit_button("選択したユーザーのパスワードを変更する")
+            if submit_change_pwd:
+                success, msg = change_user_password(change_uname, change_pwd)
+                if success:
+                    st.success(f"✅ {msg}")
+                else:
+                    st.error(f"❌ {msg}")
+        
+        # 2. 利用者の削除
+        st.markdown("<br>", unsafe_allow_html=True)
+        st.markdown("#### 🗑️ 利用者のアカウント削除")
+        delete_uname = st.selectbox("削除するユーザーIDを選択してください", list(users.keys()))
+        if st.button("🚨 選択したユーザーのアカウントを完全に削除する", type="secondary"):
+            success, msg = delete_user(delete_uname)
+            if success:
+                st.success(f"✅ {msg}")
+                st.rerun()
+            else:
+                st.error(f"❌ {msg}")
+
+    st.markdown("---")
+    st.subheader("🛡️ 管理者（開発者）マスターパスワードの変更")
+    with st.form("change_admin_pwd_form"):
+        new_admin_pwd = st.text_input("新しい管理者マスターパスワードを入力してください", type="password", placeholder="新マスターパスワードを設定")
+        submit_change_admin_pwd = st.form_submit_button("管理者パスワードを変更する")
+        if submit_change_admin_pwd:
+            success, msg = change_admin_password(new_admin_pwd)
+            if success:
+                st.success(f"✅ {msg} (次回ログイン時から適用されます)")
+            else:
+                st.error(f"❌ {msg}")
+
 def main():
+    if "logged_in" not in st.session_state:
+        st.session_state.logged_in = False
+    if "username" not in st.session_state:
+        st.session_state.username = None
+    if "is_admin" not in st.session_state:
+        st.session_state.is_admin = False
+
+    if not st.session_state.logged_in:
+        show_login_page()
+        return
+
     if "all_histories" not in st.session_state:
         st.session_state.all_histories = load_history()
     
+    # Navigation and Sidebar configuration
+    nav_options = ["🤖 AI予想ツール"]
+    if st.session_state.is_admin:
+        nav_options.append("🛡️ 開発者管理画面")
+        
+    app_mode = st.sidebar.selectbox("🧭 機能メニュー", nav_options)
+    
+    # Clean logout button in sidebar
+    st.sidebar.markdown("---")
+    if st.sidebar.button("🚪 ログアウト", use_container_width=True):
+        st.session_state.logged_in = False
+        st.session_state.username = None
+        st.session_state.is_admin = False
+        st.rerun()
+        
+    if st.session_state.is_admin and app_mode == "🛡️ 開発者管理画面":
+        show_admin_page()
+        return
+
     st.title("⛴️ BoatPredict Elite (Boaters JP)")
     st.markdown("🌐 Selenium搭載: SPA突破型フルオートスクレイピング＆オラクル予測")
     
@@ -1399,51 +1603,7 @@ def main():
             st.session_state.run_weather_search = False
             st.rerun()
     
-    # --- 収益計算ダッシュボード (Top Section) ---
-    st.markdown("<div class='metric-box' style='border-left: 8px solid #00d4ff;'>", unsafe_allow_html=True)
-    st.markdown("#### 💰 収支管理ダッシュボード")
-    
-    current_user = st.radio("👤 利用者を選択", ["T", "K", "H"], horizontal=True)
-    
-    # 次戦投資額の入力
-    next_invest_val = st.number_input("次戦の予定投資額 (円)", min_value=100, step=100, value=1000, help="この金額を元に「捲るための必要オッズ」を計算します")
-    
-    current_history = st.session_state.all_histories.get(current_user, [])
-    stats = calculate_profit_stats(current_history, next_invest_val)
-    
-    col_a, col_b, col_c, col_d = st.columns([1, 1, 1.5, 2])
-    col_a.metric("回収率", f"{stats['recovery_rate']:.1f}%")
-    col_b.metric("的中率", f"{stats['hit_rate']:.1f}%")
-    profit_color = "normal" if stats['net_profit'] >= 0 else "inverse"
-    col_c.metric("合計損益", f"{stats['net_profit']:,}円", delta=stats['net_profit'], delta_color=profit_color)
-    
-    if stats['net_profit'] < 0:
-        col_d.warning(f"🎯 **次戦必要オッズ**: **{stats['required_odds']:.2f}倍** 以上")
-    else:
-        col_d.success(f"📈 利益継続中！")
-        
-    with st.expander(f"📝 {current_user} のレース結果を記録 / 履歴管理"):
-        with st.form("top_profit_form"):
-            c1, c2 = st.columns(2)
-            f_invest = c1.number_input("投資金額 (円)", min_value=0, step=100, value=1000)
-            f_payout = c2.number_input("的中金額 (円)", min_value=0, step=10, value=0)
-            if st.form_submit_button("収支を記録"):
-                st.session_state.all_histories[current_user].append({
-                    "date": str(datetime.now().strftime("%Y/%m/%d %H:%M")),
-                    "invest": f_invest,
-                    "payout": f_payout
-                })
-                save_history(st.session_state.all_histories)
-                st.rerun()
-
-        if current_history:
-            # 最新5件を表示
-            st.dataframe(pd.DataFrame(current_history).tail(5), use_container_width=True, hide_index=True)
-            if st.button("履歴をすべてリセット"):
-                st.session_state.all_histories[current_user] = []
-                save_history(st.session_state.all_histories)
-                st.rerun()
-    st.markdown("</div>", unsafe_allow_html=True)
+    st.markdown("<br>", unsafe_allow_html=True)
     
     st.markdown("<div class='metric-box'>", unsafe_allow_html=True)
     col1, col2, col3, col4 = st.columns([2, 1, 1, 2])
