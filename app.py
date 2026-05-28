@@ -24,6 +24,9 @@ except ImportError:
     # フォールバック（万が一見つからない場合）
     VENUES_METADATA = {}
 
+from venue_win_rates import get_venue_course_win_rate
+from wind_condition_modifier import apply_wind_modifier
+
 # Streamlit Cloud 用の Playwright インストール確認
 def ensure_playwright_installed():
     try:
@@ -284,11 +287,13 @@ def scrape_full_boaters_workflow(date_str, venue_cd, race_no):
     tab_texts = asyncio.run(_headless_boaters_text_extraction(url, venue_cd))
     
     extracted = {
+        "url": url,
+        "venue": venue_cd,
         "env": {"wind_spd": 0, "wind_dir": "無風", "wave": "-", "water_level": "-", "water_temp": "-", "anteiban": False},
         "boats": [{"course": i+1, "name": "-", "class": "-", 
                    "top1_rate": 15.0, "top2_rate": 20.0, "top3_rate": 35.0, "win_rate": 10.0,
                    "avg_st": 0.16, "avg_st_rank": 3.0, "course_avg_st": "-", "course_avg_st_rank": "-",
-                   "kimarite_nige": 0.0, "kimarite_sashi": 0.0, "kimarite_makuri": 0.0,
+                   "kimarite_nige": 0.0, "kimarite_sashi": 0.0, "kimarite_makuri": 0.0, "kimarite_makurizashi": 0.0, "kimarite_nuki": 0.0,
                    "ex_st": "-", "motor_2ren": 30.0, "motor_3ren": 40.0, "f_count": "-",
                    "turn": "-", "straight": "-", "lap_time": "-", "ex_time": "-", "tilt": 0.0} 
                   for i in range(6)]
@@ -337,7 +342,7 @@ def scrape_full_boaters_workflow(date_str, venue_cd, race_no):
                                 break
                         break
 
-    # 2. 直前情報 (Extract ST and Tilt)
+    # 2. 直前情報 (Extract ST, Exhibition Time, and Tilt)
     if '直前情報' in tab_texts:
         lines = [line.strip() for line in tab_texts['直前情報'].split('\n') if line.strip()]
         for idx in range(6):
@@ -353,6 +358,9 @@ def scrape_full_boaters_workflow(date_str, venue_cd, race_no):
                             break
                     
                     if exh_idx != -1:
+                        # 展示タイムを保存 (江戸川などのオリジナル展示非公表会場の展示タイムもこれで完全に救済)
+                        extracted["boats"][idx]["ex_time"] = float(lines[exh_idx])
+                        
                         # Tilt is usually right after exhibition time (like -0.5, 0.0, 0.5)
                         for j in range(exh_idx+1, exh_idx+5):
                             if re.match(r'^[+-]?\d\.[05]$', lines[j]): # Tilt is usually .0 or .5
@@ -436,6 +444,9 @@ def scrape_full_boaters_workflow(date_str, venue_cd, race_no):
             match_name = extracted["boats"][idx]["name"]
             collected_percents = []
             
+            # 選手の決まり手データも同時に抽出する
+            nige_vals, sashi_vals, makuri_vals, makurizashi_vals, nuki_vals = [], [], [], [], []
+            
             for t_key, text_content in tab_texts.items():
                 if any(k in t_key for k in ["連対率・展開", "出走表"]):
                     t_lines = [l.strip() for l in text_content.split('\n') if l.strip()]
@@ -444,7 +455,53 @@ def scrape_full_boaters_workflow(date_str, venue_cd, race_no):
                             percents = [clean_float(t_lines[j]) for j in range(i+2, min(i+25, len(t_lines))) if "%" in t_lines[j]]
                             if len(percents) >= 3:
                                 collected_percents.append(percents)
+                            
+                            # 決まり手数をスキャン (80行のウィンドウ内)
+                            for j in range(i+1, min(i+80, len(t_lines))):
+                                line_txt = t_lines[j]
+                                if "逃げ" in line_txt or "逃" == line_txt:
+                                    for offset in range(1, 4):
+                                        if j+offset < len(t_lines):
+                                            val_m = re.search(r'(\d+)\s*(?:回|%)?', t_lines[j+offset])
+                                            if val_m and not any(k in t_lines[j+offset] for k in ["級", "別", "平均"]):
+                                                nige_vals.append(float(val_m.group(1)))
+                                                break
+                                if "差し" in line_txt or "差" == line_txt:
+                                    for offset in range(1, 4):
+                                        if j+offset < len(t_lines):
+                                            val_m = re.search(r'(\d+)\s*(?:回|%)?', t_lines[j+offset])
+                                            if val_m and not any(k in t_lines[j+offset] for k in ["級", "別", "平均"]):
+                                                sashi_vals.append(float(val_m.group(1)))
+                                                break
+                                if "まくり" in line_txt or "捲" == line_txt:
+                                    for offset in range(1, 4):
+                                        if j+offset < len(t_lines):
+                                            val_m = re.search(r'(\d+)\s*(?:回|%)?', t_lines[j+offset])
+                                            if val_m and not any(k in t_lines[j+offset] for k in ["級", "別", "平均"]):
+                                                makuri_vals.append(float(val_m.group(1)))
+                                                break
+                                if "まくり差し" in line_txt or "捲差し" in line_txt or "捲差" == line_txt:
+                                    for offset in range(1, 4):
+                                        if j+offset < len(t_lines):
+                                            val_m = re.search(r'(\d+)\s*(?:回|%)?', t_lines[j+offset])
+                                            if val_m and not any(k in t_lines[j+offset] for k in ["級", "別", "平均"]):
+                                                makurizashi_vals.append(float(val_m.group(1)))
+                                                break
+                                if "抜き" in line_txt or "抜" == line_txt:
+                                    for offset in range(1, 4):
+                                        if j+offset < len(t_lines):
+                                            val_m = re.search(r'(\d+)\s*(?:回|%)?', t_lines[j+offset])
+                                            if val_m and not any(k in t_lines[j+offset] for k in ["級", "別", "平均"]):
+                                                nuki_vals.append(float(val_m.group(1)))
+                                                break
                             break
+            
+            # 決まり手数の保存
+            if nige_vals: extracted["boats"][idx]["kimarite_nige"] = sum(nige_vals) / len(nige_vals)
+            if sashi_vals: extracted["boats"][idx]["kimarite_sashi"] = sum(sashi_vals) / len(sashi_vals)
+            if makuri_vals: extracted["boats"][idx]["kimarite_makuri"] = sum(makuri_vals) / len(makuri_vals)
+            if makurizashi_vals: extracted["boats"][idx]["kimarite_makurizashi"] = sum(makurizashi_vals) / len(makurizashi_vals)
+            if nuki_vals: extracted["boats"][idx]["kimarite_nuki"] = sum(nuki_vals) / len(nuki_vals)
             
             if collected_percents:
                 # 各モード（直近6ヶ月、一般戦、当地等）の戦績を平均化して総合勝率・連対率を算出
@@ -526,18 +583,35 @@ def calculate_synthetic_odds(bets, odds_dict):
         return 0.0
     return 1.0 / sum(1.0 / o for o in valid_odds)
 
-def parse_time_with_rank(boats, key_name):
-    times = []
-    for b in boats:
+def parse_time_with_rank(boats, key_name, venue=None):
+    raw_times = []
+    corrected_times = []
+    for i, b in enumerate(boats):
         val = str(b.get(key_name, "-")).strip()
-        if val == "-" or val == "" or val == "nan":
-            times.append(0.0)
+        parsed_val = 0.0
+        if val != "-" and val != "" and val != "nan":
+            try: parsed_val = float(re.findall(r'([0-9]+\.[0-9]+)', val)[0])
+            except: parsed_val = 9.99
+            
+        raw_times.append(parsed_val)
+        
+        # コース別・場別の展示タイム補正（秒）を適用
+        # 補正後タイム = 原タイム - 補正秒数
+        if parsed_val > 0.0 and parsed_val != 9.99 and venue:
+            course = i + 1
+            metric_map = {"lap_time": "lap", "ex_time": "ex", "straight": "straight", "turn": "turn"}
+            metric_type = metric_map.get(key_name, "ex")
+            
+            from exhibition_time_modifiers import get_exhibition_correction
+            corr = get_exhibition_correction(venue, course, metric_type)
+            corrected_val = round(parsed_val + corr, 3)
+            corrected_times.append(corrected_val)
         else:
-            try: times.append(float(re.findall(r'([0-9]+\.[0-9]+)', val)[0]))
-            except: times.append(9.99)
-    t_work = [x if x != 0.0 else 99.9 for x in times]
+            corrected_times.append(parsed_val if parsed_val > 0.0 else 0.0)
+            
+    t_work = [x if x != 0.0 else 99.9 for x in corrected_times]
     ranks = pd.Series(t_work).rank(method='min').values
-    return times, ranks
+    return raw_times, ranks, corrected_times
 
 @st.cache_data
 def load_exhibition_weights():
@@ -702,11 +776,18 @@ def calculate_oracle(data: dict, venue: str) -> dict:
             alerts.append("【風向補正】追い風5m以上：2,3コースの差し・まくり差し期待値アップ")
 
     # --- 1. Metadata Preprocessing (Rank Recalculation) ---
-    # Ensure all time ranks are correctly calculated within 1-6
-    lap_times, lap_ranks = parse_time_with_rank(boats, "lap_time")
-    ex_times, ex_ranks = parse_time_with_rank(boats, "ex_time")
-    straight_times, straight_ranks = parse_time_with_rank(boats, "straight")
-    turn_times, turn_ranks = parse_time_with_rank(boats, "turn")
+    # 江戸川はオリジナル展示タイム（直線、周り足、1周タイム）が非公表のため、重複データやノイズを完全にクリアする
+    if venue == "江戸川":
+        for b in boats:
+            b["lap_time"] = "-"
+            b["turn"] = "-"
+            b["straight"] = "-"
+
+    # Ensure all time ranks are correctly calculated within 1-6 using course and venue-specific exhibition corrections
+    lap_raw, lap_ranks, lap_corr = parse_time_with_rank(boats, "lap_time", venue)
+    ex_raw, ex_ranks, ex_corr = parse_time_with_rank(boats, "ex_time", venue)
+    straight_raw, straight_ranks, straight_corr = parse_time_with_rank(boats, "straight", venue)
+    turn_raw, turn_ranks, turn_corr = parse_time_with_rank(boats, "turn", venue)
     
     # Force recalculate course_avg_st_rank based on course_avg_st
     st_vals = [clean_float(b.get("course_avg_st", 0.16)) for b in boats]
@@ -718,13 +799,19 @@ def calculate_oracle(data: dict, venue: str) -> dict:
         boats[i]["straight_rank"] = int(straight_ranks[i])
         boats[i]["turn_rank"] = int(turn_ranks[i])
         boats[i]["course_avg_st_rank"] = int(st_ranks[i])
+        
+        # Save physical-bias-corrected times for internal scoring (keeps raw times for UI intact)
+        boats[i]["corrected_lap_time"] = lap_corr[i]
+        boats[i]["corrected_ex_time"] = ex_corr[i]
+        boats[i]["corrected_straight"] = straight_corr[i]
+        boats[i]["corrected_turn"] = turn_corr[i]
 
     # --- 2. V-Score calculation (Slit advantage) ---
     v_scores = [0.0] * 6
     for i in range(1, 6):
         prev_b = boats[i-1]
         b = boats[i]
-        ext_diff = (clean_float(prev_b.get("ex_time", 6.85), 6.85) - clean_float(b.get("ex_time", 6.85), 6.85))
+        ext_diff = (clean_float(prev_b.get("corrected_ex_time", 6.85), 6.85) - clean_float(b.get("corrected_ex_time", 6.85), 6.85))
         ast_diff = (clean_float(prev_b.get("avg_st", 0.16), 0.16) - clean_float(b.get("avg_st", 0.16), 0.16))
         v_scores[i] = (ext_diff * 10 * 0.6) + (ast_diff * 10 * 0.4)
         if v_scores[i] >= 0.5:
@@ -736,39 +823,65 @@ def calculate_oracle(data: dict, venue: str) -> dict:
         b = boats[i]
         
         if venue == "江戸川":
-            # 江戸川専用ロジック (オリジナル展示非公表対策)
+            # 江戸川専用ロジック (オリジナル展示非公表対策として、標準展示タイムの影響力を極限まで高める)
             local_win = clean_float(b.get("win_rate", b.get("top3_rate", 0.0)))
             motor_2ren = clean_float(b.get("motor_2ren", 30.0))
-            ex_time = clean_float(b.get("ex_time", 7.0), 7.0)
+            ex_time = clean_float(b.get("corrected_ex_time", 7.0), 7.0)
+            ex_rk = b.get("ex_rank", 6)
             
-            ex_perf = max(0, (7.0 - ex_time) * 200)  # 通常展示タイムの比重を高める
+            # ① 展示タイム絶対値の基本性能評価
+            ex_base_perf = max(0, (7.0 - ex_time) * 150)
+            
+            # ② 展示一番時計・二番時計による追加補正（江戸川はうねりと強風のため展示タイム順位の勝率相関が極めて高い）
+            best_ex_val = min([clean_float(x.get("corrected_ex_time", 7.0), 7.0) for x in boats])
+            ex_diff = max(0.0, round(ex_time - best_ex_val, 2))
+            
+            ex_rank_bonus = 0
+            if ex_rk == 1:
+                ex_rank_bonus = 45  # 展示一番時計に超強力ボーナス
+                # ログ・アラート追加（重複追加を防ぐため簡易チェック）
+                alert_msg = f"【江戸川特注】{i+1}号艇 {b.get('name','')} が展示一番時計を獲得（逆転または追走の確率大幅アップ）"
+                if i == 0:
+                    alert_msg = f"【江戸川特注】1号艇 {b.get('name','')} が展示一番時計を獲得。イン信頼度が飛躍的に上昇"
+                if alert_msg not in alerts:
+                    alerts.append(alert_msg)
+            elif ex_rk == 2:
+                ex_rank_bonus = 20  # 展示二番時計ボーナス
+            
+            # ③ 展示タイムの差（ギャップ）による減点（一番時計から離れるほど大幅デバフ）
+            # 0.10秒遅れで -30点
+            ex_gap_debuff = ex_diff * 300
+            
+            # 展示総合評価値
+            ex_perf = max(0, ex_base_perf + ex_rank_bonus - ex_gap_debuff)
+            
             win_perf = local_win * 2.0               # 当地勝率の比重を高める
             motor_perf = motor_2ren * 1.5            # モーター連対率の比重を高める
             st_perf = max(0, (0.25 - clean_float(b.get("course_avg_st", 0.18))) * 100)
             
             total = ex_perf + win_perf + motor_perf + st_perf
         else:
-            # A. Machine Performance (Original Exhibition)
+            # A. Base Racer Score (using Boaters' recent 10 runs, 6 months, and venue averages as the foundation)
+            racer_base = (b.get("top1_rate", 0) * 0.6 + b.get("top2_rate", 0) * 0.3 + b.get("top3_rate", 0) * 0.1) * 3.0
+            
+            # B. Machine Performance (Original Exhibition)
             m_perf = 0
             try:
-                lap_score = max(0, (38.0 - clean_float(b.get("lap_time", 38.0))) * 40)
-                turn_score = max(0, (6.0 - clean_float(b.get("turn", 6.0))) * 20)
-                strt_score = max(0, (8.0 - clean_float(b.get("straight", 8.0))) * 20)
+                lap_score = max(0, (38.0 - clean_float(b.get("corrected_lap_time", 38.0))) * 40)
+                turn_score = max(0, (6.0 - clean_float(b.get("corrected_turn", 6.0))) * 20)
+                strt_score = max(0, (8.0 - clean_float(b.get("corrected_straight", 8.0))) * 20)
                 m_perf = lap_score + turn_score + strt_score
             except: pass
             
-            # B. Exhibition Time
-            ex_perf = max(0, (7.0 - clean_float(b.get("ex_time", 7.0), 7.0)) * 100)
-            
-            # C. Winning Records (Win Rates)
-            win_perf = (b.get("top1_rate", 0) * 0.6 + b.get("top2_rate", 0) * 0.3 + b.get("top3_rate", 0) * 0.1)
+            # C. Exhibition Time
+            ex_perf = max(0, (7.0 - clean_float(b.get("corrected_ex_time", 7.0), 7.0)) * 100)
             
             # D. Start Ability
             st_perf = max(0, (0.25 - clean_float(b.get("course_avg_st", 0.18))) * 200)
             st_rank_bonus = (7 - b.get("course_avg_st_rank", 6)) * 5
             
             # E. Composite Score
-            total = m_perf + ex_perf + win_perf + st_perf + st_rank_bonus
+            total = racer_base + m_perf + ex_perf + st_perf + st_rank_bonus
         
         # F. Adjustments (Environment/V-Score/Fraud)
         # Apply the logic that was previously in s1 but more broadly
@@ -796,18 +909,20 @@ def calculate_oracle(data: dict, venue: str) -> dict:
         norm = (s / max_s) * 100
         final_display_scores.append(round(norm, 1))
 
-    # Base s1 probabilities on holistic scores + inner course advantage
-    # In-course weight: 1: +50, 2: +20, 3: +10, 4: +5, 5: 0, 6: -10
-    course_weights = [50, 20, 10, 5, 0, -10]
+    # 競艇場別・コース別の過去1年間勝率データ（%表記）に基づくダイナミック枠番補正
+    # コース実績勝率の影響が大きすぎて1号艇が圧倒的になりすぎるのを防ぐため、割合を保ったまま0.4倍に縮小
+    # さらに、風況補正（強風時の外枠有利化等）は総合スコア（実力）ではなく、「枠番の有利度（実績勝率）」のみに乗算する
+    # これにより、強風によって実力が数倍に膨らむ異常値を完璧に防ぎ、実力・機力と環境のリアルな融合を確立
     for i in range(6):
-        s1[i] = holistic_scores[i] + course_weights[i]
-        # Further boost for In-teppan (C-type)
-        if v_type == "C" and i == 0: s1[i] += 40
-        if v_type == "A" and i == 3: s1[i] += 20
+        course = i + 1
+        db_rate = get_venue_course_win_rate(venue, course)
+        scaled_db_rate = db_rate * 0.4
+        wind_scaled_db_rate = apply_wind_modifier(venue, course, wind_dir, wind_spd, scaled_db_rate)
+        s1[i] = final_display_scores[i] + wind_scaled_db_rate
 
     # Base s2/s3 probabilities (more balanced, less inner bias)
-    s2 = [holistic_scores[i] + [20, 30, 25, 15, 10, 0][i] for i in range(6)]
-    s3 = [holistic_scores[i] + [10, 20, 25, 25, 20, 10][i] for i in range(6)]
+    s2 = [final_display_scores[i] + [20, 30, 25, 15, 10, 0][i] for i in range(6)]
+    s3 = [final_display_scores[i] + [10, 20, 25, 25, 20, 10][i] for i in range(6)]
 
     # Softmax logic for probabilities
     def softmax(x, temp=10.0):
@@ -815,12 +930,168 @@ def calculate_oracle(data: dict, venue: str) -> dict:
         return e_x / e_x.sum()
 
     return {
-        "p1": softmax(np.array(s1), temp=15.0),
-        "p2": softmax(np.array(s2), temp=20.0),
-        "p3": softmax(np.array(s3), temp=25.0),
+        "p1": softmax(np.array(s1), temp=35.0),
+        "p2": softmax(np.array(s2), temp=30.0),
+        "p3": softmax(np.array(s3), temp=30.0),
         "scores": final_display_scores,
         "alerts": alerts
     }
+
+def calculate_dynamic_kimarite_rates(venue: str, course: int, wind_spd: float, wind_dir: str, b_data: dict) -> str:
+    """
+    場・コース・風・オリジナル展示タイムに基づいて、その艇の決まり手（逃げ、差し、まくり、まくり差し、抜き）の確率を動的に補正して表示する。
+    """
+    # 1. 選手の戦績からボーターズサイトの決まり手率（回数）を取得してベース値とする
+    kn = clean_float(b_data.get("kimarite_nige", 0.0))
+    ks = clean_float(b_data.get("kimarite_sashi", 0.0))
+    km = clean_float(b_data.get("kimarite_makuri", 0.0))
+    kz = clean_float(b_data.get("kimarite_makurizashi", 0.0))
+    ku = clean_float(b_data.get("kimarite_nuki", 0.0))
+    
+    total_k = kn + ks + km + kz + ku
+    
+    rates = {}
+    if total_k > 0.0:
+        # ボーターズの選手実績決まり手率をベース値とする
+        rates = {
+            "逃げ": (kn / total_k) * 97.0,
+            "差し": (ks / total_k) * 97.0,
+            "まくり": (km / total_k) * 97.0,
+            "まくり差し": (kz / total_k) * 97.0,
+            "抜き": (ku / total_k) * 97.0,
+            "恵まれ": 3.0
+        }
+        # 0.0のキーにも微小なベース値を残して、後続の機力補正や風向補正で伸びる余地を作る
+        for k in ["逃げ", "差し", "まくり", "まくり差し", "抜き"]:
+            if rates[k] == 0.0:
+                rates[k] = 2.0
+    else:
+        # 取得できなかった場合はコース別の過去1年間統計データをベースとする
+        if course == 1:
+            rates = {"逃げ": 95.0, "抜き": 4.0, "恵まれ": 1.0}
+        elif course == 2:
+            rates = {"差し": 65.0, "まくり": 20.0, "抜き": 12.0, "恵まれ": 3.0}
+        elif course == 3:
+            rates = {"まくり": 40.0, "まくり差し": 25.0, "差し": 20.0, "抜き": 12.0, "恵まれ": 3.0}
+        elif course == 4:
+            rates = {"まくり": 50.0, "まくり差し": 20.0, "差し": 15.0, "抜き": 12.0, "恵まれ": 3.0}
+        elif course == 5:
+            rates = {"まくり差し": 55.0, "まくり": 20.0, "差し": 10.0, "抜き": 12.0, "恵まれ": 3.0}
+        else: # 6コース
+            rates = {"まくり差し": 45.0, "差し": 30.0, "まくり": 10.0, "抜き": 12.0, "恵まれ": 3.0}
+
+    # 2. 枠番（コース）ごとの物理的なルール規制を厳密に適用
+    allowed_tricks = []
+    if course == 1:
+        allowed_tricks = ["逃げ", "抜き", "恵まれ"]
+    elif course == 2:
+        allowed_tricks = ["差し", "まくり", "抜き", "恵まれ"]
+    else: # 3, 4, 5, 6コース
+        allowed_tricks = ["まくり", "まくり差し", "差し", "抜き", "恵まれ"]
+
+    # 許可されていない決まり手を完全に除外（ゼロにする）
+    filtered_rates = {}
+    for trick in allowed_tricks:
+        filtered_rates[trick] = rates.get(trick, 0.0)
+        
+    # 除外した結果、合計が少なすぎる場合のセーフティネット
+    if sum(filtered_rates.values()) < 5.0:
+        if course == 1:
+            filtered_rates = {"逃げ": 95.0, "抜き": 4.0, "恵まれ": 1.0}
+        elif course == 2:
+            filtered_rates = {"差し": 75.0, "まくり": 20.0, "恵まれ": 5.0}
+        else:
+            filtered_rates = {"まくり": 40.0, "まくり差し": 25.0, "差し": 20.0, "抜き": 12.0, "恵まれ": 3.0}
+
+    # 100%に再正規化して補正の準備をする
+    total_f = sum(filtered_rates.values())
+    rates = {k: (v / total_f) * 100.0 for k, v in filtered_rates.items()}
+
+    # 3. 場別ベース補正（戸田、平和島、江戸川などの特殊性）
+    if venue == "戸田":
+        if course == 1:
+            rates["逃げ"] = max(50.0, rates.get("逃げ", 0.0) - 8.0)
+            rates["抜き"] = rates.get("抜き", 0.0) + 8.0
+        elif course in [3, 4]:
+            rates["まくり"] = rates.get("まくり", 0.0) + 15.0
+            if "差し" in rates: rates["差し"] = max(5.0, rates["差し"] - 15.0)
+    elif venue == "江戸川":
+        # 江戸川は流れがあるため「抜き」が極めて多い
+        for k in rates:
+            if k == "抜き":
+                rates[k] += 12.0
+            else:
+                rates[k] = max(5.0, rates[k] - 3.0)
+    elif venue == "平和島":
+        if course in [3, 4, 5]:
+            rates["まくり差し"] = rates.get("まくり差し", 0.0) + 10.0
+            if "まくり" in rates: rates["まくり"] = max(5.0, rates["まくり"] - 10.0)
+
+    # 3. オリジナル展示タイム（直線、周り足、展示）による補正
+    str_rk = b_data.get("straight_rank", 99)
+    ex_rk = b_data.get("ex_rank", 99)
+    turn_rk = b_data.get("turn_rank", 99)
+    lap_rk = b_data.get("lap_rank", 99)
+
+    # 直線足/伸び（展示・直線タイム）が優れている場合 ＝ まくり（1コースは逃げ）の上昇
+    if min(str_rk, ex_rk) <= 2:
+        if course == 1:
+            rates["逃げ"] = min(99.0, rates.get("逃げ", 0.0) + 3.0)
+        else:
+            if "まくり" in rates:
+                rates["まくり"] += 15.0
+                # 差し/まくり差しを減少
+                for k in ["差し", "まくり差し"]:
+                    if k in rates: rates[k] = max(5.0, rates[k] - 7.5)
+    elif max(str_rk, ex_rk) >= 5: # 直線足が非常に悪い場合
+        if course == 1:
+            rates["逃げ"] = max(50.0, rates.get("逃げ", 0.0) - 8.0)
+            rates["抜き"] = rates.get("抜き", 0.0) + 8.0
+        else:
+            if "まくり" in rates:
+                rates["まくり"] = max(5.0, rates["まくり"] - 15.0)
+                if "差し" in rates: rates["差し"] += 7.5
+                if "まくり差し" in rates: rates["まくり差し"] += 7.5
+
+    # 出足/回り足（回り足、1周タイム）が優れている場合 ＝ 差し・まくり差しの上昇
+    if min(turn_rk, lap_rk) <= 2:
+        if course == 2:
+            rates["差し"] += 15.0
+            if "まくり" in rates: rates["まくり"] = max(5.0, rates["まくり"] - 15.0)
+        elif course in [3, 4, 5, 6]:
+            if "まくり差し" in rates:
+                rates["まくり差し"] += 15.0
+                if "まくり" in rates: rates["まくり"] = max(5.0, rates["まくり"] - 15.0)
+
+    # 4. 風向・風速による補正
+    is_tailwind = "追い風" in wind_dir or any(d in wind_dir for d in ["南", "南東", "南南東", "南南西", "南西"])
+    is_headwind = "向かい風" in wind_dir or any(d in wind_dir for d in ["北", "北西", "北北西", "北北東", "北東"])
+
+    if wind_spd >= 5.0: # 強風：ミスが出やすく「抜き」「差し」が増え、「まくり」が減る
+        rates["抜き"] = rates.get("抜き", 0.0) + 10.0
+        for k in rates:
+            if k == "まくり": rates[k] = max(5.0, rates[k] - 10.0)
+    elif wind_spd >= 3.0:
+        if is_tailwind: # 追い風：1マーク流されやすく「逃げ」「差し」に有利
+            if course == 1: rates["逃げ"] = min(99.0, rates.get("逃げ", 0.0) + 3.0)
+            if course == 2: rates["差し"] += 8.0; rates["まくり"] = max(5.0, rates["まくり"] - 8.0)
+        elif is_headwind: # 向かい風：ダッシュの伸びが良くなり「まくり」有利
+            if course == 1: rates["逃げ"] = max(50.0, rates.get("逃げ", 0.0) - 5.0)
+            if course in [3, 4, 5]:
+                if "まくり" in rates: rates["まくり"] += 10.0
+                if "まくり差し" in rates: rates["まくり差し"] += 5.0
+
+    # 5. 正規化（合計100%にする）
+    total_val = sum(rates.values())
+    for k in rates:
+        rates[k] = (rates[k] / total_val) * 100.0
+
+    # 6. 上位2つの決まり手をフォーマットして表示
+    sorted_rates = sorted(rates.items(), key=lambda x: x[1], reverse=True)
+    if len(sorted_rates) >= 2 and sorted_rates[1][1] >= 15.0:
+        return f"{sorted_rates[0][0]} {sorted_rates[0][1]:.0f}%<br><span style='font-size: 10px; color: #64748b;'>{sorted_rates[1][0]} {sorted_rates[1][1]:.0f}%</span>"
+    else:
+        return f"{sorted_rates[0][0]} {sorted_rates[0][1]:.0f}%"
 
 def analyze_kimarite_and_bets(oracle_results: dict, data: dict, venue: str, bet_count: int, prediction_mode="通常", special_odds_threshold=40.0, special_exclude_1_head=False) -> dict:
     p1 = oracle_results["p1"]
@@ -1030,178 +1301,51 @@ def main():
             import rough_race_finder
             import importlib
             importlib.reload(rough_race_finder)
-            try:
-                loop = asyncio.get_event_loop()
-            except RuntimeError:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-            
             # Step 1: Lightweight Primary Scraping
+            # nest_asyncio適用済みのためasyncio.run()で統一（Cloud・ローカル両対応）
             t_date = st.session_state.get("target_search_date")
-            if loop.is_running():
-                import nest_asyncio
-                nest_asyncio.apply()
-                future = asyncio.ensure_future(rough_race_finder.find_rough_races_today(t_date))
-                candidates, date_hd = loop.run_until_complete(future)
-            else:
-                candidates, date_hd = loop.run_until_complete(rough_race_finder.find_rough_races_today(t_date))
-            
-            if not candidates:
-                status.update(label="❌ 対象レースが見つかりませんでした。", state="error")
+            import nest_asyncio
+            nest_asyncio.apply()
+            candidates, date_hd, search_status = asyncio.run(rough_race_finder.find_rough_races_today(t_date))
+
+            if search_status == "no_timing":
+                status.update(
+                    label="⏰ 締切15分以内のレースがまだありません。しばらく待ってから再検索してください。",
+                    state="complete"
+                )
+                st.info("💡 オリジナル展示タイムはレース締切の約15分前に公表されます。直前になってから再度「波乱レース検索」を押してください。")
+                st.session_state.run_rough_search = False
+            elif search_status == "no_exhibition":
+                status.update(
+                    label="⏳ 締切15分以内のレースはありますが、展示タイムがまだ公表されていません。",
+                    state="complete"
+                )
+                st.warning("📡 展示タイムの公表を待っています。1〜2分後に再度「波乱レース検索」を押してください。")
+                st.session_state.run_rough_search = False
+            elif candidates:
+                status.update(label=f"✅ {len(candidates)}件のレース状況をオリジナル展示解析しました！", state="complete", expanded=False)
+                # オリジナル展示タイム（一周・まわり足等）を含む詳細テーブルを表示
+                rows = []
+                for cand in candidates:
+                    rows.append({
+                        "締切": cand.get("deadline", "-"),
+                        "会場・レース": f"{cand['venue']} {cand['race_no']}R",
+                        "判定": cand.get("status", "-"),
+                        "イン展示/一周": f"{cand.get('b1_ex')} / {cand.get('b1_lap')}",
+                        "最速展示": cand.get("best_ex", "-"),
+                        "一周最速艇": f"{cand.get('best_lap')}号",
+                        "波乱スコア": cand.get("score", 0),
+                        "波乱の理由": cand.get("reasons", "-")
+                    })
+                # スコア順にソート
+                rows.sort(key=lambda r: r["波乱スコア"], reverse=True)
+                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+                st.success("🔥 波乱スコアが高いほど、一周タイムや展示タイムでインが劣勢な「荒れる期待値が高い」レースです。")
                 st.session_state.run_rough_search = False
             else:
-                status.write(f"✅ {len(candidates)}件の直前レース対象（フォールバック含む）を抽出しました。")
-                status.update(label="🔍 解析フェーズ2: オリジナル展示・直前情報を深掘りパース中...", state="running")
-                
-                # Step 2: Deep Dive with Playwright
-                final_results = []
-                target_date_str = f"{date_hd[:4]}-{date_hd[4:6]}-{date_hd[6:8]}"
-                
-                # 特定会場の独占を防ぐため、会場ごとに候補を分散させて選出
-                diverse_candidates = []
-                temp_venue_counts = {}
-                for cand in candidates:
-                    v_name = cand["venue"]
-                    v_count = temp_venue_counts.get(v_name, 0)
-                    if v_count < 3: # 各場最大3件まで詳細解析へ
-                        diverse_candidates.append(cand)
-                        temp_venue_counts[v_name] = v_count + 1
-                
-                target_candidates = diverse_candidates[:30]
-                
-                status.write(f"📊 {len(temp_venue_counts)}会場から計{len(target_candidates)}レースを詳細展示解析対象に選出しました。")
-                
-                progress_bar = st.progress(0)
-                for i, cand in enumerate(target_candidates):
-                    v_name = cand["venue"]
-                    v_cd = VENUES_METADATA.get(v_name, {}).get("cd", "unknown")
-                    r_no = cand["race_no"]
-                    deadline_str = cand.get("deadline", "-")
-                    
-                    status.write(f"⏳ 展示解析中: {v_name} {r_no}R (締切予定: {deadline_str})...")
-                    
-                    try:
-                        # Boatersの詳細データを取得
-                        detail = scrape_full_boaters_workflow(target_date_str, v_cd, r_no)
-                        
-                        # 万舟スコアリング
-                        m_score = 0
-                        m_reasons = cand["reasons"].copy()
-                        
-                        s1_boats = cand.get("boats", [])
-                        b1_s1 = s1_boats[0] if s1_boats else {}
-                        
-                        # 1. 1号艇の実力不安 (大幅加点)
-                        b1_wr = b1_s1.get("win_rate", 0)
-                        if b1_wr > 0:
-                            if b1_wr < 4.5: m_score += 60 # 激アツ
-                            elif b1_wr < 5.5: m_score += 40
-                            elif b1_wr < 6.5: m_score += 20
-
-                        # 2. 混戦度 (実力均衡) 判定
-                        win_rates = [b.get("win_rate", 0) for b in s1_boats if b.get("win_rate", 0) > 0]
-                        if len(win_rates) >= 4:
-                            avg_wr = sum(win_rates) / len(win_rates)
-                            wr_std = (sum([(w - avg_wr)**2 for w in win_rates]) / len(win_rates))**0.5
-                            if wr_std < 0.8: # 全員の実力が近い
-                                m_score += 30
-                                m_reasons.append(f"実力伯仲(混戦度:{round(wr_std, 2)})")
-
-                        # 3. 外枠の逆転要素
-                        for b in s1_boats[2:]: # 3-6
-                            wr = b.get("win_rate", 0)
-                            if wr >= 6.8: m_score += 25
-                            elif wr >= 6.2: m_score += 15
-
-                        # 4. 会場補正
-                        v_meta = VENUES_METADATA.get(v_name, {})
-                        v_manshu_score_raw = v_meta.get("manshu_score", 0)
-                        v_bonus = int(v_manshu_score_raw * 0.35)
-                        m_score += v_bonus
-                        if v_bonus > 0: m_reasons.append(f"会場特性({v_name})")
-                        elif v_bonus < 0: m_reasons.append(f"イン堅調場({v_name})")
-
-                        # 5. 特殊条件 (F, モーター, 風)
-                        f_count = detail["boats"][0].get("f_count", "-")
-                        if cand.get("boat1_f") or (f_count != "-" and re.search(r'F[1-9]', f_count)):
-                            m_score += 30
-                            m_reasons.append(f"1号艇F({f_count if f_count != '-' else 'F1+'})")
-                        
-                        m_2ren = detail["boats"][0].get("motor_2ren", 0)
-                        if 0 < m_2ren < 28.0:
-                            m_score += 25
-                            m_reasons.append(f"1号艇モーター不安({m_2ren}%)")
-
-                        w_spd = detail["env"].get("wind_spd", 0)
-                        if w_spd >= 5.0:
-                            m_score += 25
-                            m_reasons.append(f"強風({w_spd}m)")
-                            
-                        if detail["env"].get("anteiban", False):
-                            m_score -= 15
-                            m_reasons.append("安定板使用(まくり抑制)")
-                            
-                        # 6. オリジナル展示・直前情報による波乱要素 (展示タイム異常など)
-                        ex_times = []
-                        for b in detail["boats"]:
-                            t_val = clean_float(b.get("ex_time", 9.99))
-                            if t_val < 9.0: ex_times.append(t_val)
-                            
-                        if ex_times:
-                            min_ex = min(ex_times)
-                            # 外枠(4,5,6号艇)が一番時計の場合
-                            for idx, b in enumerate(detail["boats"][3:], 3):
-                                if clean_float(b.get("ex_time", 9.99)) == min_ex:
-                                    m_score += 35
-                                    m_reasons.append(f"外枠展示トップ({idx+1}号艇 {min_ex}秒)")
-                                    break
-                                    
-                            # 1号艇の展示タイム劣勢
-                            b1_ex = clean_float(detail["boats"][0].get("ex_time", 9.99))
-                            if b1_ex > min_ex + 0.08:
-                                m_score += 30
-                                m_reasons.append(f"1号艇展示劣勢(差+{round(b1_ex - min_ex, 2)}秒)")
-
-                        # チルト跳ね上げ選手
-                        for idx, b in enumerate(detail["boats"]):
-                            tilt = clean_float(b.get("tilt", 0.0))
-                            if tilt >= 0.5:
-                                m_score += 25
-                                m_reasons.append(f"{idx+1}号艇チルト跳ね({tilt})")
-                                break
-
-                        final_results.append({
-                            "締切予定": deadline_str,
-                            "会場・レース": f"{v_name} {r_no}R",
-                            "万舟スコア": m_score,
-                            "波乱予測の理由": " / ".join(m_reasons)
-                        })
-                    except Exception as e:
-                        status.write(f"⚠️ {v_name} {r_no}R の詳細解析に失敗しました。")
-                    
-                    progress_bar.progress((i + 1) / len(target_candidates))
-                
-                status.update(label="✅ 全候補の展示・直前情報解析が完了しました！", state="complete", expanded=False)
-                
-                if final_results:
-                    final_results.sort(key=lambda x: x["万舟スコア"], reverse=True)
-                    
-                    filtered_results = []
-                    venue_counts = {}
-                    for res in final_results:
-                        v_name = res["会場・レース"].split(" ")[0]
-                        count = venue_counts.get(v_name, 0)
-                        if count < 3:
-                            filtered_results.append(res)
-                            venue_counts[v_name] = count + 1
-                        
-                        if len(filtered_results) >= 15:
-                            break
-                            
-                    st.dataframe(pd.DataFrame(filtered_results), use_container_width=True, hide_index=True)
-                    st.success("🔥 スコアが高いほど、直前展示から判断した万舟券（100倍以上）の発生確率が高まっています！")
-                else:
-                    st.warning("詳細展示解析の結果、推奨できるレースがありませんでした。")
+                status.update(label="❌ 展示タイムが公表されているレースが見つかりませんでした。", state="complete")
+                st.info("💡 展示タイムは締切の約15〜20分前に公表されます。少し時間をおいてから再度お試しください。")
+                st.session_state.run_rough_search = False
 
         if st.button("レーダー表示を閉じる"):
             st.session_state.run_rough_search = False
@@ -1215,16 +1359,10 @@ def main():
             import rough_race_finder
             import importlib
             importlib.reload(rough_race_finder)
-            try: loop = asyncio.get_event_loop()
-            except RuntimeError: loop = asyncio.new_event_loop(); asyncio.set_event_loop(loop)
-            
             t_date = st.session_state.get("target_search_date")
-            if loop.is_running():
-                import nest_asyncio; nest_asyncio.apply()
-                future = asyncio.ensure_future(rough_race_finder.find_rough_weather_venues(t_date))
-                weather_data = loop.run_until_complete(future)
-            else:
-                weather_data = loop.run_until_complete(rough_race_finder.find_rough_weather_venues(t_date))
+            import nest_asyncio
+            nest_asyncio.apply()
+            weather_data = asyncio.run(rough_race_finder.find_rough_weather_venues(t_date))
                 
             if not weather_data:
                 status.update(label="❌ 気象情報の取得に失敗しました。", state="error")
@@ -1338,19 +1476,14 @@ def main():
         st.markdown("<div style='font-size: 14px; color: #666; margin-bottom: 10px;'>※モバイル端末でも設定しやすいようにこちらに配置しました。</div>", unsafe_allow_html=True)
         
         # デフォルト値
-        manshu_points = 20
         special_exclude_1_head = False
         special_odds_threshold = 40.0
         
         col_s1, col_s2 = st.columns(2)
         with col_s1:
             if prediction_mode == "万舟的中":
-                manshu_points = st.selectbox("万舟的中モード：推奨点数", [20, 30, 40], index=0)
-                st.markdown("<div style='margin-bottom: 5px;'></div>", unsafe_allow_html=True)
                 special_exclude_1_head = st.radio("万舟的中モード：1号艇1着", ["1頭入り", "1頭切り"], horizontal=True) == "1頭切り"
             elif prediction_mode == "中穴・大穴的中":
-                manshu_points = st.selectbox("中穴・大穴的中モード：推奨点数", [10, 20, 30, 40], index=0)
-                st.markdown("<div style='margin-bottom: 5px;'></div>", unsafe_allow_html=True)
                 special_exclude_1_head = st.radio("中穴・大穴的中モード：1号艇1着", ["1頭入り", "1頭切り"], horizontal=True) == "1頭切り"
             else:
                 st.write("通常モードではこの設定は使用されません")
@@ -1433,7 +1566,10 @@ def main():
     """, unsafe_allow_html=True)
     
     st.markdown("<br>", unsafe_allow_html=True)
-    bet_points = st.radio("表示する推奨買い目（通常モードの3連単）", [6, 10], horizontal=True, format_func=lambda x: f"最強 {x} 点に絞る")
+    if prediction_mode == "通常":
+        bet_points = st.radio("表示する推奨買い目（通常モードの3連単）", [6, 10], index=1, horizontal=True, format_func=lambda x: f"最強 {x} 点に絞る")
+    else:
+        bet_points = st.radio(f"表示する推奨買い目（{prediction_mode}の3連単）", [10, 20, 30, 40], index=1, horizontal=True, format_func=lambda x: f"最強 {x} 点に絞る")
     st.markdown("</div>", unsafe_allow_html=True)
 
     if st.button("AI予想を生成（※裏でブラウザを立ち上げてデータ収集します。5〜10秒ほどお待ちください）", type="primary"):
@@ -1441,8 +1577,8 @@ def main():
             data = scrape_full_boaters_workflow(str(target_date), VENUES[venue_name], race_no)
             oracle_results = calculate_oracle(data, venue_name)
             
-            # If manshu mode, use selected points
-            actual_bet_points = manshu_points if prediction_mode in ["万舟的中", "中穴・大穴的中"] else bet_points
+            # Use unified dynamic bet_points directly
+            actual_bet_points = bet_points
             res_analysis = analyze_kimarite_and_bets(oracle_results, data, venue_name, actual_bet_points, prediction_mode=prediction_mode, special_odds_threshold=special_odds_threshold, special_exclude_1_head=special_exclude_1_head)
             
             st.session_state.result = {
@@ -1455,7 +1591,7 @@ def main():
         oracle_results = res["oracle"]
         
         # ユーザーがUI上でモードや設定を変更した際、即座に最新設定で再解析して反映する
-        actual_bet_points = manshu_points if prediction_mode in ["万舟的中", "中穴・大穴的中"] else bet_points
+        actual_bet_points = bet_points
         ana = analyze_kimarite_and_bets(oracle_results, data, venue_name, actual_bet_points, prediction_mode=prediction_mode, special_odds_threshold=special_odds_threshold, special_exclude_1_head=special_exclude_1_head)
         res["analysis"] = ana
         res["prediction_mode"] = prediction_mode
@@ -1504,7 +1640,7 @@ def main():
                 rec_points = "6点 〜 10点"
                 rec_odds = "10倍 〜 25倍 (本命〜絞り込み)"
                 rec_strategy = f"本命優勢展開。{market_fav_boat}号艇頭から相手を絞り込み、確実な的中と回収を両立させてください。"
-        elif dyn_roughness >= 55.0 or (ai_fav_win < 0.40 and min_all_odds >= 12.0):
+        elif dyn_roughness >= 55.0 or (ai_fav_win < 0.35 and min_all_odds >= 10.0):
             # 真の万舟レース（波乱要素・オッズともに大混戦濃厚）
             rec_mode = "万舟的中"
             rec_payout = "10,000円〜 (オッズ100倍以上・大穴万舟帯)"
@@ -1519,7 +1655,7 @@ def main():
             rec_points = "30点 〜 40点"
             rec_odds = "100倍 以上 (万舟狙い)"
             rec_strategy = strat_desc
-        elif dyn_roughness >= 40.0 or (5.0 <= min_all_odds < 10.0) or (0.40 <= ai_fav_win < 0.55):
+        elif dyn_roughness >= 28.0 or (5.0 <= min_all_odds < 10.0) or (0.35 <= ai_fav_win < 0.50):
             # 中穴・大穴狙いレース（オッズ妙味・ヒモ荒れ濃厚）
             rec_mode = "中穴・大穴的中"
             rec_payout = "3,000円〜9,990円 (オッズ30倍〜99倍・中穴帯)"
@@ -1578,28 +1714,181 @@ def main():
         
         # Boat Detailed Stats (Moved to Top)
         st.markdown("### 🛥️ 各出場艇の最新解析スタッツ")
-        df_list = []
+        
+        # HTMLテーブルのスタイルとヘッダー生成
+        boat_colors = [
+            "background-color: #ffffff; color: #1a1a1a; border: 1px solid #cbd5e1;", # 1号艇 (白)
+            "background-color: #334155; color: #ffffff;", # 2号艇 (黒/チャコール)
+            "background-color: #ef4444; color: #ffffff;", # 3号艇 (赤)
+            "background-color: #3b82f6; color: #ffffff;", # 4号艇 (青)
+            "background-color: #eab308; color: #1a1a1a;", # 5号艇 (黄)
+            "background-color: #22c55e; color: #ffffff;"  # 6号艇 (緑)
+        ]
+        
+        def get_rank_badge(rk):
+            if rk == 1: return '<span class="rank-badge rank-1">1位</span>'
+            if rk == 2: return '<span class="rank-badge rank-2">2位</span>'
+            if rk == 3: return '<span class="rank-badge rank-3">3位</span>'
+            if rk == 4: return '<span class="rank-badge rank-4">4位</span>'
+            if rk == 5: return '<span class="rank-badge rank-5">5位</span>'
+            if rk == 6: return '<span class="rank-badge rank-6">6位</span>'
+            return ''
+
+        table_html = """
+        <style>
+        .custom-stats-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 15px 0;
+            font-size: 13px;
+            text-align: center;
+            border-radius: 8px;
+            overflow: hidden;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.05);
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        }
+        .custom-stats-table th {
+            background-color: #1e293b;
+            color: #f8fafc;
+            font-weight: 600;
+            padding: 10px 8px;
+            font-size: 12px;
+        }
+        .custom-stats-table td {
+            padding: 8px 10px;
+            border-bottom: 1px solid #f1f5f9;
+            background-color: #ffffff;
+            color: #334155;
+            vertical-align: middle;
+        }
+        .custom-stats-table tr:nth-of-type(even) td {
+            background-color: #f8fafc;
+        }
+        .custom-stats-table tr:hover td {
+            background-color: #f1f5f9;
+        }
+        .rank-badge {
+            display: inline-block;
+            padding: 2px 5px;
+            border-radius: 4px;
+            font-weight: bold;
+            font-size: 10px;
+            color: #ffffff;
+            margin-left: 5px;
+        }
+        .rank-1 { background-color: #ef4444; } /* 1位: 赤 */
+        .rank-2 { background-color: #f97316; } /* 2位: オレンジ */
+        .rank-3 { background-color: #22c55e; } /* 3位: 緑 */
+        .rank-4 { background-color: #64748b; color: #fff; } /* 4位: 灰色 */
+        .rank-5 { background-color: #94a3b8; color: #fff; } /* 5位: 薄い灰色 */
+        .rank-6 { background-color: #3b82f6; } /* 6位: 青 */
+        </style>
+        <table class="custom-stats-table">
+            <thead>
+                <tr>
+                    <th>枠</th>
+                    <th>選手名(級)</th>
+                    <th>展示</th>
+                    <th>展示(補正後)</th>
+                    <th>1周</th>
+                    <th>1周(補正後)</th>
+                    <th>周り足</th>
+                    <th>周り足(補正後)</th>
+                    <th>直線</th>
+                    <th>直線(補正後)</th>
+                    <th>1着率(AI)</th>
+                    <th>2着率(AI)</th>
+                    <th>3着率(AI)</th>
+                    <th>3連対率(AI)</th>
+                    <th>決まり手(AI)</th>
+                    <th>総合スコア</th>
+                </tr>
+            </thead>
+            <tbody>
+        """
+        
         for i, b in enumerate(data["boats"]):
-            def fmt(nm, rk): return f"{b[nm]} [{b.get(rk,99)}位]" if str(b[nm]) not in ["-",""] else "-"
+            # 江戸川はオリジナル展示タイム（直線、周り足、1周タイム）が非公表のため、表示上で強制クリアする
+            # URL、保存されたvenue名、UI選択名の中に「edogawa」か「江戸川」が含まれる場合は江戸川と判定し鉄壁ガード
+            is_edogawa = (
+                "edogawa" in str(data.get("url", "")).lower() or 
+                data.get("venue") == "edogawa" or 
+                (isinstance(venue_name, str) and ("江戸川" in venue_name or "edogawa" in venue_name.lower()))
+            )
             
-            course_st_val = b.get("course_avg_st", "-")
-            course_rk_val = b.get("course_avg_st_rank", "-")
-            cm_str = f"{course_st_val} [{course_rk_val}位]" if course_st_val != "-" else "-"
+            # 各タイムと順位の取得
+            raw_ex = str(b.get("ex_time", "-")).strip()
+            corr_ex = b.get("corrected_ex_time", "-")
+            ex_rk = b.get("ex_rank", 99)
             
-            df_list.append({
-                "枠": f"{i+1}号艇",
-                "選手名(級)": b["name"],
-                "枠番平均ST": cm_str,
-                "展示タイム": fmt("ex_time", "ex_rank"),
-                "1周タイム": fmt("lap_time", "lap_rank"),
-                "周り足": b.get("turn", "-"),
-                "直線足": b.get("straight", "-"),
-                "1着率(AI)": f"{res['oracle']['p1'][i]*100:.1f}%",
-                "2着率(AI)": f"{res['oracle']['p2'][i]*100:.1f}%",
-                "3着率(AI)": f"{res['oracle']['p3'][i]*100:.1f}%",
-                "総合スコア": round(res["oracle"]["scores"][i], 2),
-            })
-        st.dataframe(pd.DataFrame(df_list), use_container_width=True, hide_index=True)
+            raw_lap = "-" if is_edogawa else str(b.get("lap_time", "-")).strip()
+            corr_lap = "-" if is_edogawa else b.get("corrected_lap_time", "-")
+            lap_rk = 99 if is_edogawa else b.get("lap_rank", 99)
+            
+            raw_turn = "-" if is_edogawa else str(b.get("turn", "-")).strip()
+            corr_turn = "-" if is_edogawa else b.get("corrected_turn", "-")
+            turn_rk = 99 if is_edogawa else b.get("turn_rank", 99)
+            
+            raw_str = "-" if is_edogawa else str(b.get("straight", "-")).strip()
+            corr_str = "-" if is_edogawa else b.get("corrected_straight", "-")
+            str_rk = 99 if is_edogawa else b.get("straight_rank", 99)
+
+            def make_cell(raw_v, corr_v, rk):
+                if raw_v in ["-", "", "nan"] or corr_v in ["-", 0.0, 99.9, 9.99]:
+                    return "-", "-"
+                
+                try: corr_f = f"{float(corr_v):.2f}"
+                except: corr_f = str(corr_v)
+                
+                badge_html = get_rank_badge(rk)
+                return raw_v, f"{corr_f}{badge_html}"
+                
+            ex_cell_raw, ex_cell_corr = make_cell(raw_ex, corr_ex, ex_rk)
+            lap_cell_raw, lap_cell_corr = make_cell(raw_lap, corr_lap, lap_rk)
+            turn_cell_raw, turn_cell_corr = make_cell(raw_turn, corr_turn, turn_rk)
+            str_cell_raw, str_cell_corr = make_cell(raw_str, corr_str, str_rk)
+            
+            boat_pill = f'<span style="display: inline-block; padding: 2px 7px; border-radius: 4px; font-weight: bold; font-size: 11px; {boat_colors[i]}">{i+1}</span>'
+            
+            p1_val = res['oracle']['p1'][i]
+            p2_val = res['oracle']['p2'][i]
+            p3_val = res['oracle']['p3'][i]
+            top3_rate = (p1_val + p2_val + p3_val) * 100.0
+            
+            env_data = data.get("env", {})
+            wind_spd = clean_float(env_data.get("wind_spd", 0.0))
+            wind_dir = str(env_data.get("wind_dir", "無風"))
+            kimarite_html = calculate_dynamic_kimarite_rates(venue_name, i + 1, wind_spd, wind_dir, b)
+            
+            table_html += f"""
+                <tr>
+                    <td>{boat_pill}</td>
+                    <td style="font-weight: 600; text-align: left;">{b["name"]}</td>
+                    <td>{ex_cell_raw}</td>
+                    <td style="font-weight: 500;">{ex_cell_corr}</td>
+                    <td>{lap_cell_raw}</td>
+                    <td style="font-weight: 500;">{lap_cell_corr}</td>
+                    <td>{ex_cell_raw if raw_turn == "-" and raw_ex != "-" else raw_turn}</td>
+                    <td style="font-weight: 500;">{ex_cell_corr if corr_turn in ["-", 0.0] and corr_ex not in ["-", 0.0] else turn_cell_corr}</td>
+                    <td>{ex_cell_raw if raw_str == "-" and raw_ex != "-" else raw_str}</td>
+                    <td style="font-weight: 500;">{ex_cell_corr if corr_str in ["-", 0.0] and corr_ex not in ["-", 0.0] else str_cell_corr}</td>
+                    <td style="color: #ef4444; font-weight: bold;">{p1_val*100:.1f}%</td>
+                    <td style="color: #f97316; font-weight: 500;">{p2_val*100:.1f}%</td>
+                    <td style="color: #22c55e; font-weight: 500;">{p3_val*100:.1f}%</td>
+                    <td style="color: #8b5cf6; font-weight: bold;">{top3_rate:.1f}%</td>
+                    <td style="font-weight: 500; line-height: 1.2;">{kimarite_html}</td>
+                    <td style="font-weight: bold; background-color: #f8fafc;">{round(res["oracle"]["scores"][i], 1)}</td>
+                </tr>
+            """
+            
+        table_html += """
+            </tbody>
+        </table>
+        """
+        
+        # dedent/strip HTML lines to prevent markdown parser from treating it as a code block due to indentation
+        table_html_clean = "\n".join([line.strip() for line in table_html.split("\n")])
+        st.markdown(table_html_clean, unsafe_allow_html=True)
 
         if ana["alerts"]:
             with st.expander("⚠️ AIからの警告メッセージ"):
