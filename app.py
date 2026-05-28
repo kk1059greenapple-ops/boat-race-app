@@ -1476,14 +1476,19 @@ def main():
         st.markdown("<div style='font-size: 14px; color: #666; margin-bottom: 10px;'>※モバイル端末でも設定しやすいようにこちらに配置しました。</div>", unsafe_allow_html=True)
         
         # デフォルト値
+        manshu_points = 20
         special_exclude_1_head = False
         special_odds_threshold = 40.0
         
         col_s1, col_s2 = st.columns(2)
         with col_s1:
             if prediction_mode == "万舟的中":
+                manshu_points = st.selectbox("万舟的中モード：推奨点数", [10, 20, 30, 40], index=1)
+                st.markdown("<div style='margin-bottom: 5px;'></div>", unsafe_allow_html=True)
                 special_exclude_1_head = st.radio("万舟的中モード：1号艇1着", ["1頭入り", "1頭切り"], horizontal=True) == "1頭切り"
             elif prediction_mode == "中穴・大穴的中":
+                manshu_points = st.selectbox("中穴・大穴的中モード：推奨点数", [10, 20, 30, 40], index=1)
+                st.markdown("<div style='margin-bottom: 5px;'></div>", unsafe_allow_html=True)
                 special_exclude_1_head = st.radio("中穴・大穴的中モード：1号艇1着", ["1頭入り", "1頭切り"], horizontal=True) == "1頭切り"
             else:
                 st.write("通常モードではこの設定は使用されません")
@@ -1566,10 +1571,7 @@ def main():
     """, unsafe_allow_html=True)
     
     st.markdown("<br>", unsafe_allow_html=True)
-    if prediction_mode == "通常":
-        bet_points = st.radio("表示する推奨買い目（通常モードの3連単）", [6, 10], index=1, horizontal=True, format_func=lambda x: f"最強 {x} 点に絞る")
-    else:
-        bet_points = st.radio(f"表示する推奨買い目（{prediction_mode}の3連単）", [10, 20, 30, 40], index=1, horizontal=True, format_func=lambda x: f"最強 {x} 点に絞る")
+    bet_points = st.radio("表示する推奨買い目（通常モードの3連単）", [6, 10], horizontal=True, format_func=lambda x: f"最強 {x} 点に絞る")
     st.markdown("</div>", unsafe_allow_html=True)
 
     if st.button("AI予想を生成（※裏でブラウザを立ち上げてデータ収集します。5〜10秒ほどお待ちください）", type="primary"):
@@ -1577,8 +1579,8 @@ def main():
             data = scrape_full_boaters_workflow(str(target_date), VENUES[venue_name], race_no)
             oracle_results = calculate_oracle(data, venue_name)
             
-            # Use unified dynamic bet_points directly
-            actual_bet_points = bet_points
+            # If manshu mode, use selected points
+            actual_bet_points = manshu_points if prediction_mode in ["万舟的中", "中穴・大穴的中"] else bet_points
             res_analysis = analyze_kimarite_and_bets(oracle_results, data, venue_name, actual_bet_points, prediction_mode=prediction_mode, special_odds_threshold=special_odds_threshold, special_exclude_1_head=special_exclude_1_head)
             
             st.session_state.result = {
@@ -1591,7 +1593,7 @@ def main():
         oracle_results = res["oracle"]
         
         # ユーザーがUI上でモードや設定を変更した際、即座に最新設定で再解析して反映する
-        actual_bet_points = bet_points
+        actual_bet_points = manshu_points if prediction_mode in ["万舟的中", "中穴・大穴的中"] else bet_points
         ana = analyze_kimarite_and_bets(oracle_results, data, venue_name, actual_bet_points, prediction_mode=prediction_mode, special_odds_threshold=special_odds_threshold, special_exclude_1_head=special_exclude_1_head)
         res["analysis"] = ana
         res["prediction_mode"] = prediction_mode
