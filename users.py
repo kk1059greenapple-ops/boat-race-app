@@ -1,8 +1,36 @@
 import json
 import os
 import hashlib
+import requests
+import streamlit as st
 
 USERS_FILE = "users.json"
+ADMIN_CONFIG_FILE = "admin_config.json"
+
+def get_firebase_config():
+    """
+    StreamlitのSecretsまたは環境変数からFirebaseの設定を取得します。
+    """
+    try:
+        if "firebase" in st.secrets:
+            url = st.secrets["firebase"].get("url")
+            secret = st.secrets["firebase"].get("secret")
+            if url and secret:
+                # 末尾のスラッシュを取り除く
+                if url.endswith("/"):
+                    url = url[:-1]
+                return url, secret
+    except Exception:
+        pass
+    
+    url = os.environ.get("FIREBASE_URL")
+    secret = os.environ.get("FIREBASE_SECRET")
+    if url and secret:
+        if url.endswith("/"):
+            url = url[:-1]
+        return url, secret
+        
+    return None, None
 
 def hash_password(password, salt=None):
     """
@@ -22,8 +50,20 @@ def verify_password(password, stored_hash, salt):
 
 def load_users():
     """
-    users.json から登録ユーザー情報を読み込みます。
+    users.json から登録ユーザー情報を読み込みます（Firebase優先、ローカルフォールバック）。
     """
+    url, secret = get_firebase_config()
+    if url and secret:
+        try:
+            req_url = f"{url}/users.json?auth={secret}"
+            res = requests.get(req_url, timeout=5)
+            if res.status_code == 200:
+                data = res.json()
+                return data if data is not None else {}
+        except Exception:
+            pass
+            
+    # ローカルフォールバック
     if os.path.exists(USERS_FILE):
         try:
             with open(USERS_FILE, "r", encoding="utf-8") as f:
@@ -34,8 +74,19 @@ def load_users():
 
 def save_users(users_data):
     """
-    users.json にユーザー情報を安全に保存します。
+    users.json にユーザー情報を安全に保存します（Firebase優先、ローカルフォールバック）。
     """
+    url, secret = get_firebase_config()
+    if url and secret:
+        try:
+            req_url = f"{url}/users.json?auth={secret}"
+            res = requests.put(req_url, json=users_data, timeout=5)
+            if res.status_code == 200:
+                return True
+        except Exception:
+            pass
+            
+    # ローカルフォールバック
     try:
         with open(USERS_FILE, "w", encoding="utf-8") as f:
             json.dump(users_data, f, ensure_ascii=False, indent=4)
@@ -109,12 +160,22 @@ def change_user_password(username, new_password):
         return True, f"ユーザー '{username}' のパスワードを正常に変更しました。"
     return False, "データベースの保存に失敗しました。"
 
-ADMIN_CONFIG_FILE = "admin_config.json"
-
 def load_admin_password():
     """
-    管理者用パスワードのハッシュとソルトを取得します。
+    管理者用パスワードのハッシュとソルトを取得します（Firebase優先、ローカルフォールバック）。
     """
+    url, secret = get_firebase_config()
+    if url and secret:
+        try:
+            req_url = f"{url}/admin_config.json?auth={secret}"
+            res = requests.get(req_url, timeout=5)
+            if res.status_code == 200:
+                data = res.json()
+                return data
+        except Exception:
+            pass
+            
+    # ローカルフォールバック
     if os.path.exists(ADMIN_CONFIG_FILE):
         try:
             with open(ADMIN_CONFIG_FILE, "r", encoding="utf-8") as f:
@@ -125,7 +186,7 @@ def load_admin_password():
 
 def change_admin_password(new_password):
     """
-    管理者用マスターパスワードを変更し、ハッシュ化して保存します。
+    管理者用マスターパスワードを変更し、ハッシュ化して保存します（Firebase優先、ローカルフォールバック）。
     """
     if not new_password:
         return False, "パスワードが空です。"
@@ -134,6 +195,18 @@ def change_admin_password(new_password):
         "password_hash": pwd_hash,
         "salt": salt
     }
+    
+    url, secret = get_firebase_config()
+    if url and secret:
+        try:
+            req_url = f"{url}/admin_config.json?auth={secret}"
+            res = requests.put(req_url, json=config, timeout=5)
+            if res.status_code == 200:
+                return True, "管理者パスワードを正常に変更しました。"
+        except Exception:
+            pass
+            
+    # ローカルフォールバック
     try:
         with open(ADMIN_CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(config, f, ensure_ascii=False, indent=4)
