@@ -1,0 +1,20 @@
+# Credentials and local state
+users.json
+admin_config.json
+profit_history.json
+boat_learning_db.json
+detail_data.json
+
+# Temporary / Debug / Dump files
+dump_*
+debug_screenshot.png
+debug_source.html
+*.html
+*.png
+
+# Python environment
+__pycache__/
+*.pyc
+
+# Streamlit config (local secrets if any)
+.streamlit/
